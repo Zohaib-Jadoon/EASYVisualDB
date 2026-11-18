@@ -1,0 +1,75 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+@import "@xyflow/react/dist/style.css";
+
+@layer base {
+  :root {
+    --vds-bg-canvas: #f7f8fc;
+    --vds-bg-surface: #ffffff;
+    --vds-bg-subtle: #f1f3f9;
+    --vds-sidebar: #13172b;
+    --vds-text-primary: #1b2340;
+    --vds-text-secondary: #64748b;
+    --vds-border: #e2e6f0;
+    --vds-accent: #6d4aff;
+    --vds-accent-hover: #5b38f0;
+    --vds-success: #16a66a;
+    --vds-warning: #d98218;
+    --vds-danger: #e5484d;
+  }
+
+  .dark {
+    --vds-bg-canvas: #0b0f1e;
+    --vds-bg-surface: #12172b;
+    --vds-bg-subtle: #181f38;
+    --vds-sidebar: #090d1a;
+    --vds-text-primary: #eef2ff;
+    --vds-text-secondary: #94a3b8;
+    --vds-border: #232b45;
+    --vds-accent: #7c5cff;
+    --vds-accent-hover: #8f75ff;
+    --vds-success: #22c55e;
+    --vds-warning: #f59e0b;
+    --vds-danger: #f87171;
+  }
+
+  body {
+    font-family: "DM Sans", system-ui, -apple-system, sans-serif;
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: "Plus Jakarta Sans", system-ui, -apple-system, sans-serif;
+  }
+
+  code, pre, .font-mono {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* React Flow theme integration */
+.react-flow__controls {
+  border: 1px solid var(--vds-border) !important;
+  border-radius: 8px !important;
+  overflow: hidden;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08) !important;
+}
+
+.react-flow__controls-button {
+  background: var(--vds-bg-surface) !important;
+  color: var(--vds-text-primary) !important;
+  border-bottom: 1px solid var(--vds-border) !important;
+}
+
+.react-flow__controls-button:hover {
+  background: var(--vds-bg-subtle) !important;
+}
+
+.react-flow__minimap {
+  background: var(--vds-bg-surface) !important;
+  border: 1px solid var(--vds-border) !important;
+  border-radius: 8px !important;
+}

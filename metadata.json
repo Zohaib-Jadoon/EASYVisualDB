@@ -1,0 +1,6 @@
+{
+  "name": "Visual Database Studio",
+  "description": "The no-code command center for Microsoft SQL Server — visual schema design, guided table builder, spreadsheet data grid, and guarded change workflows.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
