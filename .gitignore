@@ -10,3 +10,12 @@ data/
 .playwright-cli/
 .aistudio/
 public/assets/aistudio/
+agent/.env.agent
+agent/run-agent.cmd
+agent/dist/
+agent/node_modules/
+dist-electron/
+release/
+*.exe
+*.blockmap
+

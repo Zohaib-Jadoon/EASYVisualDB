@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   Activity,
   ArrowRight,
@@ -7,6 +7,7 @@ import {
   GitBranch,
   Lock,
   Plug,
+  RefreshCw,
   ShieldCheck,
   Table2,
   TableProperties,
@@ -33,6 +34,7 @@ interface OverviewPageProps {
   loadingSandbox: boolean;
   onMountSampleSandbox: () => void;
   onToggleReadOnly: (conn: ConnectionProfile) => void;
+  onCheckHealth: (conn: ConnectionProfile) => Promise<void>;
   onNavigate: (nav: NavSection) => void;
 }
 
@@ -47,27 +49,29 @@ export function OverviewPage({
   loadingSandbox,
   onMountSampleSandbox,
   onToggleReadOnly,
+  onCheckHealth,
   onNavigate,
 }: OverviewPageProps) {
+  const [checkingHealth, setCheckingHealth] = useState(false);
+
   const pendingPlans = plans.filter(
     (p) => p.status === 'draft' || p.status === 'validated' || p.status === 'pending_approval' || p.status === 'approved'
   );
   const failedPlans = plans.filter((p) => p.status === 'failed');
 
-  // Honest Empty State when zero databases are connected
   if (connections.length === 0) {
     return (
       <div className="max-w-5xl mx-auto space-y-8 py-4">
         <section className="rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] p-6 lg:p-10">
           <div className="max-w-2xl space-y-4">
             <div className="text-xs font-medium text-[#6D4AFF]">
-              {workspace?.organizationName ?? 'Workspace'} · Read-Only by Default
+              {workspace?.organizationName ?? 'Workspace'} · Disconnected State
             </div>
             <h1 className="font-display text-2xl lg:text-3xl font-bold tracking-tight text-[#1B2340] dark:text-white text-balance">
-              Connect your SQL Server to explore and design safely
+              No SQL Server connected — ready for setup or offline drafting
             </h1>
             <p className="text-sm lg:text-base text-slate-600 dark:text-slate-400 leading-relaxed">
-              No databases are connected in this workspace yet. Connect a Microsoft SQL Server 2019–2025 or Azure SQL instance over validated TLS, or launch a real local sample database to test table building, visual ER diagrams, and guarded change plans.
+              Connect a local Windows SQL Server instance, remote Windows Server, private network host via the Windows Connector Agent, or Azure SQL Database. Alternatively, mount the optional SQLite learning sandbox for offline exploration.
             </p>
             <div className="pt-2 flex flex-wrap items-center gap-3">
               <button
@@ -76,7 +80,7 @@ export function OverviewPage({
                 className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-[#6D4AFF] hover:bg-[#5B38F0] text-white text-sm font-medium transition-colors whitespace-nowrap"
               >
                 <Plug className="h-4 w-4" />
-                <span>Connect SQL Server</span>
+                <span>Connect or Discover SQL Server</span>
               </button>
               <button
                 type="button"
@@ -85,7 +89,7 @@ export function OverviewPage({
                 className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg border border-[#E2E6F0] dark:border-[#232B45] bg-[#F7F8FC] dark:bg-[#181F38] hover:bg-slate-100 dark:hover:bg-slate-800 text-[#1B2340] dark:text-white text-sm font-medium transition-colors whitespace-nowrap disabled:opacity-60"
               >
                 <Database className="h-4 w-4 text-[#6D4AFF]" />
-                <span>{loadingSandbox ? 'Preparing Sample Database...' : 'Load Interactive Sample Database'}</span>
+                <span>{loadingSandbox ? 'Preparing Sample Database...' : 'Load SQLite Learning Sandbox'}</span>
               </button>
             </div>
           </div>
@@ -94,18 +98,18 @@ export function OverviewPage({
         <section className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div className="rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] p-5 space-y-2">
             <div className="text-sm font-semibold text-[#1B2340] dark:text-white">
-              01. Plain-Language Design
+              01. Local Discovery & Agents
             </div>
             <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
-              Create tables with understandable field types like Text, Whole Number, Date, and Automatic ID while inspecting exact generated T-SQL.
+              Detect local Windows SQL Server instances with user consent or tunnel outbound from private networks using the Windows Connector Agent.
             </p>
           </div>
           <div className="rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] p-5 space-y-2">
             <div className="text-sm font-semibold text-[#1B2340] dark:text-white">
-              02. Least-Privilege Guardrails
+              02. Strict T-SQL & Least Privilege
             </div>
             <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
-              New connections open in Explorer (Read-Only) mode. Every schema change requires preflight checks, SQL review, and explicit confirmation.
+              New connections open in Explorer (Read-Only) mode. Every schema plan validates T-SQL syntax, TLS settings, and approval policies before running.
             </p>
           </div>
           <div className="rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] p-5 space-y-2">
@@ -113,7 +117,7 @@ export function OverviewPage({
               03. Customer-Owned Data
             </div>
             <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
-              Rows remain inside your SQL Server instance. The SaaS control plane stores only metadata snapshots, change plans, and redacted audit trails.
+              Production rows stay inside your SQL Server engine. The SaaS control plane tracks only metadata snapshots, plans, and redacted audit logs.
             </p>
           </div>
         </section>
@@ -127,7 +131,6 @@ export function OverviewPage({
 
   return (
     <div className="max-w-7xl mx-auto space-y-6">
-      {/* Header Banner */}
       <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
         <div>
           <h1 className="font-display text-2xl font-bold tracking-tight text-[#1B2340] dark:text-white">
@@ -139,6 +142,14 @@ export function OverviewPage({
             <span className="font-mono">{activeConnection?.database}</span>
             <span aria-hidden="true">·</span>
             <span className="capitalize">{activeConnection?.environment}</span>
+            <span aria-hidden="true">·</span>
+            <span>
+              {activeConnection?.method === 'local_sandbox'
+                ? 'SQLite Sandbox Adapter'
+                : activeConnection?.method === 'windows_agent'
+                ? 'Windows Agent Tunnel'
+                : 'Direct MSSQL T-SQL Adapter'}
+            </span>
             {mode === 'developer' && snapshot && (
               <>
                 <span aria-hidden="true">·</span>
@@ -183,7 +194,6 @@ export function OverviewPage({
         )}
       </div>
 
-      {/* 4-Column KPI Strip */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] p-4">
           <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
@@ -234,7 +244,6 @@ export function OverviewPage({
         </div>
       </div>
 
-      {/* Quick Actions */}
       <section className="rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] p-5">
         <h2 className="font-display text-sm font-semibold text-[#1B2340] dark:text-white">
           Quick Actions
@@ -264,7 +273,7 @@ export function OverviewPage({
               <Table2 className="h-4 w-4 text-[#6D4AFF]" />
               <div>
                 <div className="text-sm font-medium text-[#1B2340] dark:text-white">Browse Records</div>
-                <div className="text-xs text-slate-500 dark:text-slate-400">Spreadsheet grid & CSV</div>
+                <div className="text-xs text-slate-500 dark:text-slate-400">Spreadsheet & Excel/CSV</div>
               </div>
             </div>
             <ArrowRight className="h-4 w-4 text-slate-400" />
@@ -279,7 +288,7 @@ export function OverviewPage({
               <Database className="h-4 w-4 text-[#6D4AFF]" />
               <div>
                 <div className="text-sm font-medium text-[#1B2340] dark:text-white">Query Builder</div>
-                <div className="text-xs text-slate-500 dark:text-slate-400">No-code filters & export</div>
+                <div className="text-xs text-slate-500 dark:text-slate-400">Joins, filters & export</div>
               </div>
             </div>
             <ArrowRight className="h-4 w-4 text-slate-400" />
@@ -304,17 +313,44 @@ export function OverviewPage({
         </div>
       </section>
 
-      {/* Split Lower Row: Connection Health + Recent Activity */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <section className="rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] p-5 space-y-4">
           <div className="flex items-center justify-between">
-            <h2 className="font-display text-sm font-semibold text-[#1B2340] dark:text-white">
-              Connection Health
+            <h2 className="font-display text-sm font-semibold text-[#1B2340] dark:text-white flex items-center gap-2">
+              <Activity className={`h-4 w-4 ${activeConnection?.status === 'connected' ? 'text-[#16A66A]' : 'text-[#E5484D]'}`} />
+              <span>Connection Health</span>
             </h2>
-            <Activity className="h-4 w-4 text-[#16A66A]" />
+            {activeConnection && (
+              <button
+                type="button"
+                disabled={checkingHealth}
+                onClick={async () => {
+                  setCheckingHealth(true);
+                  try {
+                    await onCheckHealth(activeConnection);
+                  } finally {
+                    setCheckingHealth(false);
+                  }
+                }}
+                className="inline-flex items-center gap-1 text-xs font-medium text-[#6D4AFF] hover:underline disabled:opacity-50"
+              >
+                <RefreshCw className={`h-3 w-3 ${checkingHealth ? 'animate-spin' : ''}`} />
+                <span>{checkingHealth ? 'Checking...' : 'Check Now'}</span>
+              </button>
+            )}
           </div>
           {activeConnection && (
             <dl className="space-y-2.5 text-xs">
+              <div className="flex justify-between py-1.5 border-b border-[#E2E6F0] dark:border-[#232B45]">
+                <dt className="text-slate-500 dark:text-slate-400">Live Status</dt>
+                <dd
+                  className={`font-medium capitalize ${
+                    activeConnection.status === 'connected' ? 'text-[#16A66A]' : 'text-[#E5484D]'
+                  }`}
+                >
+                  {activeConnection.status}
+                </dd>
+              </div>
               <div className="flex justify-between py-1.5 border-b border-[#E2E6F0] dark:border-[#232B45]">
                 <dt className="text-slate-500 dark:text-slate-400">Transport</dt>
                 <dd className="font-medium text-[#1B2340] dark:text-white">

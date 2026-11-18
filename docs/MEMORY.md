@@ -1,24 +1,21 @@
 # Project Memory — Visual Database Studio
 
-## Current State
-- **Architecture**: Full-stack Express (`server.ts`) + React 19 / Vite + Tailwind v4 + `node:sqlite` Control Plane + `mssql` SQL Server connector + local `NorthwindOps_Sample` relational sandbox.
-- **Implemented Modules**:
-  - Multi-tenant Workspaces, RBAC (`Owner`, `Admin`, `Designer`, `Data Editor`, `Viewer`), and Plan Entitlements (`Free`, `Pro`, `Team`, `Enterprise`).
-  - SQL Server Connection Wizard with 4-step diagnostics (`reachability`, `tls`, `authentication`, `permissions`), AES-256-GCM secret storage, secret rotation, and Windows Connector Agent pairing tokens.
-  - Database Explorer & No-Code Table Builder (`Simple` and `Developer` modes) with live T-SQL preview and preflight checks.
-  - Visual Database Designer (`@xyflow/react`) with interactive column-to-column FK linking, layout persistence, and SVG export.
-  - Spreadsheet Records Grid with server-side 50-row pagination, sorting, search, typed inserts, optimistic concurrency inline updates, controlled PK deletes, and CSV import/export.
-  - Visual Query Builder & SQL Editor with parameterized queries, saved scripts, and query history.
-  - Change Center (`Draft -> Validated -> Pending Approval -> Approved -> Executed`) with separation-of-duties and destructive confirmation phrases.
-  - Opt-in Gemini AI Assistant (`gemini-4-hydrogen`) for schema drafting and read-only NL-to-SQL.
-  - Append-only redacted Audit & Activity History.
+## Current Engineering State
+- **Dual-Edition Architecture (Web + Windows Electron Desktop)**:
+  - **Web Edition**: Express + WebSocket Gateway (`server.ts`) + React 19 / Vite + Tailwind v4 + `node:sqlite` Control Plane (`data/control-plane.db`) + Data-Plane Adapters + Standalone Windows Connector Agent (`agent/`).
+  - **Desktop Edition (`electron/`)**: Electron `45.3.4` (`BrowserWindow` + `preload.ts` + `utilityProcess.fork` bundled backend `dist-electron/server.mjs`) + Windows DPAPI (`safeStorage`) master key storage in `%APPDATA%\Visual Database Studio` + native Windows menus (`File`, `Edit`, `Database`, `View`, `Tools`, `Help`), native Windows file dialogs (`.csv`, `.xlsx`, `.svg`), multi-monitor window state persistence, and `electron-builder` x64 NSIS & Portable packaging config (`electron-builder.yml`). Zero manual Node.js installation required for Desktop end users.
+- **Unified SQL Server Adapter (`src/lib/db/sqlserver.ts`)**:
+  - `SqlServerAdapter` (`sqlServerAdapter`) implements `checkHealth()`, `discoverLocalInstances()`, `getWindowsAuthSupport()`, `introspectSchema()`, `executeTSql()`, `applySchemaOperations()`, `closeAllPools()`, structured error classification (`classifySqlServerError`), and full `DatabaseAdapter` methods.
+  - `src/server/adapters/mssqlAdapter.ts` delegates directly to `sqlServerAdapter`.
+  - Distinguishes honestly between Windows NTLM (`domain\user` + password via `mssql`/`tedious`) and passwordless Windows SSPI (`msnodesqlv8` + Microsoft ODBC Driver 17/18) — never silently falls back or mislabels NTLM.
+- **Clean Engine Separation**:
+  - Real SQL Server functionality (`SqlServerAdapter` & `AgentTunnelAdapter`) generates Microsoft SQL Server T-SQL.
+  - Optional SQLite learning sandbox (`SandboxAdapter` / `NorthwindOps_Sample`) remains strictly isolated for offline exploration.
 
-## Verification Status
-- Pure-logic unit tests (`src/shared/sqlCompiler.test.ts`, `src/shared/permissions.test.ts`): **11/11 passing** via `npx --yes tsx --test`.
-- TypeScript & Vite build: `compile_applet` and `lint_applet` (`tsc --noEmit`) passing with 0 errors.
-- Browser E2E verification (`playwright-cli` at `1440x900` Light/Dark and `390x844` Mobile): verified Honest Empty State, Interactive Sample Sandbox mount, Connection Read-Only -> Read-Write toggle, Table Builder -> Change Center transactional execution, Visual Designer (`@xyflow/react` smoothstep ER graph), Records grid, Visual Query Builder, SQL Editor, Database Explorer, AI Assistant, Audit & History, Team & Billing, and mobile drawer navigation with 0 console errors and 0 horizontal overflow.
-
-## Pending / Future Production Hardening
-- Native signed `.msi` Windows Connector Agent binary (pairing/revocation control plane is implemented).
-- Live payment webhook integration (Stripe/regional processor adapter) for commercial billing checkout.
-- Automated SQL Server 2019/2022/2025 Docker test fixture matrix in CI.
+## Latest Verification Snapshot
+- **Typecheck & Lint (`npm run lint`)**: `tsc --noEmit` and `tsc -p electron/tsconfig.json --noEmit` exit `0`.
+- **Web + Agent Tests (`npm test`)**: **21/21 passing**.
+- **Desktop & SQL Server Adapter Tests (`npm run desktop:test`)**: **10/10 passing** (Electron security/CSP/origin/redaction helpers, `clampWindowBounds`, `DesktopUpdater` verification guard, live `127.0.0.1` loopback backend auth/origin checks, `SqlServerAdapter` config/NTLM/SSPI-honesty/error classification).
+- **Desktop Bundle (`npm run desktop:build`)**: Compiles `dist/` (`vite build`) and `dist-electron/{main.cjs,preload.cjs,server.mjs}`; smoke-tested booting `node dist-electron/server.mjs` in desktop loopback mode cleanly.
+- **Playwright Browser Verification**: Verified Web UI on `1440x900` Light/Dark and `390x844` mobile with `0` console/network errors, including fixed mobile sidebar positioning (`fixed` on mobile, `lg:relative` on desktop), Edition Info modal, and Keyboard Shortcuts modal.
+- **Pending Windows-Host Verification**: Live Electron Chromium GUI launch, Windows NSIS/Portable `.exe` build (`electron-builder --win --x64`, as Linux container lacks `wine`/`makensis` and GTK desktop libs), Windows DPAPI runtime encryption, and live SQL Server / Windows Auth / SSPI connections await execution on Windows 11.

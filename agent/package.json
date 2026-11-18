@@ -1,0 +1,24 @@
+{
+  "name": "visual-db-studio-windows-agent",
+  "version": "1.0.0",
+  "description": "Windows 11 / Windows Server outbound connector agent for Visual Database Studio",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "tsx --test src/discovery.test.ts"
+  },
+  "dependencies": {
+    "mssql": "^12.7.14",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/mssql": "^12.3.0",
+    "@types/node": "^22.14.0",
+    "@types/ws": "^8.18.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.8.0"
+  }
+}

@@ -4,6 +4,8 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import {
   AuditEvent,
+  AuthUser,
+  BillingCheckoutSession,
   ChangePlan,
   ConnectionProfile,
   DiagramNodePosition,
@@ -11,14 +13,18 @@ import {
   SchemaSnapshot,
   SubscriptionInfo,
   WindowsAgentRecord,
+  WorkspaceInvitation,
   WorkspaceMember,
   WorkspacePolicy,
   WorkspaceRole,
   WorkspaceSummary,
 } from '../shared/types';
-import { decryptSecret, encryptSecret, redactSensitiveText } from './crypto';
+import { decryptSecret, encryptSecret, hashPassword, redactSensitiveText, verifyPassword } from './crypto';
+import { MigrationRecord, runControlPlaneMigrations } from './migrations';
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
+const DATA_DIR = process.env.VDS_DATA_DIR
+  ? path.resolve(process.env.VDS_DATA_DIR)
+  : path.resolve(process.cwd(), 'data');
 const CONTROL_DB_PATH = path.join(DATA_DIR, 'control-plane.db');
 
 export const PLAN_CATALOG: Record<
@@ -63,165 +69,27 @@ export const PLAN_CATALOG: Record<
   },
 };
 
-class ControlPlaneStore {
+export class ControlPlaneStore {
+  private migrations: MigrationRecord[] = [];
   private db: DatabaseSync;
 
-  constructor() {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    this.db = new DatabaseSync(CONTROL_DB_PATH);
+  constructor(dbPath = CONTROL_DB_PATH) {
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    this.db = new DatabaseSync(dbPath);
     this.initSchema();
     this.ensureDefaultWorkspace();
   }
 
+  close() {
+    this.db.close();
+  }
+
   private initSchema() {
-    this.db.exec(`
-      PRAGMA journal_mode = WAL;
-      PRAGMA foreign_keys = ON;
+    this.migrations = runControlPlaneMigrations(this.db);
+  }
 
-      CREATE TABLE IF NOT EXISTS workspaces (
-        id TEXT PRIMARY KEY,
-        organization_name TEXT NOT NULL,
-        name TEXT NOT NULL,
-        region TEXT NOT NULL,
-        plan_tier TEXT NOT NULL,
-        policy_json TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS members (
-        id TEXT PRIMARY KEY,
-        workspace_id TEXT NOT NULL,
-        name TEXT NOT NULL,
-        email TEXT NOT NULL,
-        role TEXT NOT NULL,
-        schema_write INTEGER NOT NULL,
-        data_write INTEGER NOT NULL,
-        mfa_enabled INTEGER NOT NULL,
-        status TEXT NOT NULL,
-        joined_at TEXT NOT NULL,
-        FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
-      );
-
-      CREATE TABLE IF NOT EXISTS connections (
-        id TEXT PRIMARY KEY,
-        workspace_id TEXT NOT NULL,
-        name TEXT NOT NULL,
-        method TEXT NOT NULL,
-        host TEXT NOT NULL,
-        port INTEGER NOT NULL,
-        database_name TEXT NOT NULL,
-        auth_method TEXT NOT NULL,
-        username TEXT NOT NULL,
-        encrypted_secret TEXT NOT NULL,
-        encrypt INTEGER NOT NULL,
-        trust_cert INTEGER NOT NULL,
-        read_only INTEGER NOT NULL,
-        environment TEXT NOT NULL,
-        status TEXT NOT NULL,
-        engine_version TEXT NOT NULL,
-        last_checked_at TEXT NOT NULL,
-        last_error TEXT,
-        capabilities_json TEXT NOT NULL,
-        agent_id TEXT,
-        FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
-      );
-
-      CREATE TABLE IF NOT EXISTS schema_snapshots (
-        connection_id TEXT PRIMARY KEY,
-        workspace_id TEXT NOT NULL,
-        snapshot_json TEXT NOT NULL,
-        fingerprint TEXT NOT NULL,
-        captured_at TEXT NOT NULL,
-        FOREIGN KEY (connection_id) REFERENCES connections(id) ON DELETE CASCADE
-      );
-
-      CREATE TABLE IF NOT EXISTS change_plans (
-        id TEXT PRIMARY KEY,
-        workspace_id TEXT NOT NULL,
-        connection_id TEXT NOT NULL,
-        connection_name TEXT NOT NULL,
-        environment TEXT NOT NULL,
-        title TEXT NOT NULL,
-        plain_explanation TEXT NOT NULL,
-        operations_json TEXT NOT NULL,
-        sql_preview TEXT NOT NULL,
-        risk_level TEXT NOT NULL,
-        requires_confirm_text TEXT,
-        requires_approval INTEGER NOT NULL,
-        status TEXT NOT NULL,
-        target_fingerprint TEXT NOT NULL,
-        digest TEXT NOT NULL,
-        preflight_json TEXT NOT NULL,
-        created_by_id TEXT NOT NULL,
-        created_by_name TEXT NOT NULL,
-        approved_by_id TEXT,
-        approved_by_name TEXT,
-        created_at TEXT NOT NULL,
-        executed_at TEXT,
-        execution_summary TEXT,
-        error_message TEXT,
-        FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
-      );
-
-      CREATE TABLE IF NOT EXISTS audit_events (
-        id TEXT PRIMARY KEY,
-        workspace_id TEXT NOT NULL,
-        correlation_id TEXT NOT NULL,
-        actor_id TEXT NOT NULL,
-        actor_name TEXT NOT NULL,
-        actor_role TEXT NOT NULL,
-        action TEXT NOT NULL,
-        resource_type TEXT NOT NULL,
-        target TEXT NOT NULL,
-        database_name TEXT,
-        status TEXT NOT NULL,
-        detail TEXT NOT NULL,
-        timestamp TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS diagram_layouts (
-        connection_id TEXT PRIMARY KEY,
-        workspace_id TEXT NOT NULL,
-        positions_json TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        FOREIGN KEY (connection_id) REFERENCES connections(id) ON DELETE CASCADE
-      );
-
-      CREATE TABLE IF NOT EXISTS saved_queries (
-        id TEXT PRIMARY KEY,
-        workspace_id TEXT NOT NULL,
-        connection_id TEXT NOT NULL,
-        name TEXT NOT NULL,
-        sql_text TEXT NOT NULL,
-        created_by TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS query_history (
-        id TEXT PRIMARY KEY,
-        workspace_id TEXT NOT NULL,
-        connection_id TEXT NOT NULL,
-        actor_name TEXT NOT NULL,
-        sql_text TEXT NOT NULL,
-        row_count INTEGER NOT NULL,
-        duration_ms INTEGER NOT NULL,
-        status TEXT NOT NULL,
-        executed_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS windows_agents (
-        id TEXT PRIMARY KEY,
-        workspace_id TEXT NOT NULL,
-        name TEXT NOT NULL,
-        hostname TEXT NOT NULL,
-        version TEXT NOT NULL,
-        status TEXT NOT NULL,
-        last_heartbeat_at TEXT,
-        pairing_token_hash TEXT NOT NULL,
-        pairing_token_preview TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
-    `);
+  getMigrations(): MigrationRecord[] {
+    return this.migrations;
   }
 
   private ensureDefaultWorkspace() {
@@ -481,6 +349,13 @@ class ControlPlaneStore {
     return this.getWorkspaceSummary(workspaceId).subscription;
   }
 
+  listAllConnections(): ConnectionProfile[] {
+    const rows = this.db
+      .prepare('SELECT * FROM connections ORDER BY last_checked_at DESC')
+      .all() as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapConnectionRow(r));
+  }
+
   listConnections(workspaceId: string): ConnectionProfile[] {
     const rows = this.db
       .prepare('SELECT * FROM connections WHERE workspace_id = ? ORDER BY last_checked_at DESC')
@@ -513,10 +388,10 @@ class ControlPlaneStore {
     this.db
       .prepare(
         `INSERT INTO connections (
-          id, workspace_id, name, method, host, port, database_name, auth_method,
-          username, encrypted_secret, encrypt, trust_cert, read_only, environment,
-          status, engine_version, last_checked_at, last_error, capabilities_json, agent_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          id, workspace_id, name, method, host, instance_name, port, database_name, auth_method,
+          username, domain, encrypted_secret, encrypt, trust_cert, read_only, timeout_ms, reconnect_on_startup,
+          environment, status, engine_version, last_checked_at, last_error, capabilities_json, agent_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         id,
@@ -524,14 +399,18 @@ class ControlPlaneStore {
         profile.name,
         profile.method,
         profile.host,
+        profile.instanceName ?? null,
         profile.port,
         profile.database,
         profile.authMethod,
         profile.username,
+        profile.domain ?? null,
         encrypted,
         profile.encrypt ? 1 : 0,
         profile.trustServerCertificate ? 1 : 0,
         profile.readOnly ? 1 : 0,
+        profile.timeoutMs ?? 8000,
+        profile.reconnectOnStartup ? 1 : 0,
         profile.environment,
         profile.status,
         profile.engineVersion,
@@ -547,7 +426,22 @@ class ControlPlaneStore {
   updateConnection(
     workspaceId: string,
     connectionId: string,
-    updates: Partial<Pick<ConnectionProfile, 'readOnly' | 'status' | 'lastCheckedAt' | 'lastError' | 'name' | 'environment'>> & {
+    updates: Partial<
+      Pick<
+        ConnectionProfile,
+        | 'readOnly'
+        | 'status'
+        | 'lastCheckedAt'
+        | 'lastError'
+        | 'name'
+        | 'environment'
+        | 'reconnectOnStartup'
+        | 'timeoutMs'
+        | 'engineVersion'
+        | 'capabilities'
+        | 'database'
+      >
+    > & {
       newSecret?: string;
     }
   ): ConnectionProfile {
@@ -560,10 +454,16 @@ class ControlPlaneStore {
     const nextError = updates.lastError !== undefined ? updates.lastError : existing.lastError;
     const nextName = updates.name ?? existing.name;
     const nextEnv = updates.environment ?? existing.environment;
+    const nextReconnect =
+      updates.reconnectOnStartup !== undefined ? updates.reconnectOnStartup : existing.reconnectOnStartup;
+    const nextTimeout = updates.timeoutMs ?? existing.timeoutMs;
+    const nextEngine = updates.engineVersion ?? existing.engineVersion;
+    const nextCaps = updates.capabilities ?? existing.capabilities;
+    const nextDb = updates.database ?? existing.database;
 
     this.db
       .prepare(
-        `UPDATE connections SET read_only = ?, status = ?, last_checked_at = ?, last_error = ?, name = ?, environment = ?
+        `UPDATE connections SET read_only = ?, status = ?, last_checked_at = ?, last_error = ?, name = ?, environment = ?, reconnect_on_startup = ?, timeout_ms = ?, engine_version = ?, capabilities_json = ?, database_name = ?
          WHERE id = ? AND workspace_id = ?`
       )
       .run(
@@ -573,6 +473,11 @@ class ControlPlaneStore {
         nextError ?? null,
         nextName,
         nextEnv,
+        nextReconnect ? 1 : 0,
+        nextTimeout,
+        nextEngine,
+        JSON.stringify(nextCaps),
+        nextDb,
         connectionId,
         workspaceId
       );
@@ -637,15 +542,15 @@ class ControlPlaneStore {
     return row ? this.mapPlanRow(row) : null;
   }
 
-  saveChangePlan(plan: ChangePlan): void {
+  saveChangePlan(plan: ChangePlan, baselineSnapshot?: SchemaSnapshot | null): void {
     this.db
       .prepare(
         `INSERT INTO change_plans (
           id, workspace_id, connection_id, connection_name, environment, title, plain_explanation,
           operations_json, sql_preview, risk_level, requires_confirm_text, requires_approval,
           status, target_fingerprint, digest, preflight_json, created_by_id, created_by_name,
-          approved_by_id, approved_by_name, created_at, executed_at, execution_summary, error_message
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          approved_by_id, approved_by_name, created_at, executed_at, execution_summary, error_message, baseline_snapshot_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         plan.id,
@@ -671,8 +576,53 @@ class ControlPlaneStore {
         plan.createdAt,
         plan.executedAt ?? null,
         plan.executionSummary ?? null,
-        plan.errorMessage ?? null
+        plan.errorMessage ?? null,
+        baselineSnapshot ? JSON.stringify(baselineSnapshot) : null
       );
+  }
+
+  getPlanBaselineSnapshot(workspaceId: string, planId: string): SchemaSnapshot | null {
+    const row = this.db
+      .prepare('SELECT baseline_snapshot_json FROM change_plans WHERE id = ? AND workspace_id = ?')
+      .get(planId, workspaceId) as { baseline_snapshot_json: string | null } | undefined;
+    return row?.baseline_snapshot_json ? (JSON.parse(row.baseline_snapshot_json) as SchemaSnapshot) : null;
+  }
+
+  revalidateChangePlan(
+    workspaceId: string,
+    planId: string,
+    updates: Pick<
+      ChangePlan,
+      'sqlPreview' | 'plainExplanation' | 'riskLevel' | 'requiresConfirmText' | 'targetFingerprint' | 'digest' | 'preflight' | 'status'
+    >,
+    baselineSnapshot: SchemaSnapshot
+  ): ChangePlan {
+    this.db
+      .prepare(
+        `UPDATE change_plans SET sql_preview = ?, plain_explanation = ?, risk_level = ?, requires_confirm_text = ?, target_fingerprint = ?, digest = ?, preflight_json = ?, status = ?, approved_by_id = NULL, approved_by_name = NULL, baseline_snapshot_json = ?
+         WHERE id = ? AND workspace_id = ?`
+      )
+      .run(
+        updates.sqlPreview,
+        updates.plainExplanation,
+        updates.riskLevel,
+        updates.requiresConfirmText ?? null,
+        updates.targetFingerprint,
+        updates.digest,
+        JSON.stringify(updates.preflight),
+        updates.status,
+        JSON.stringify(baselineSnapshot),
+        planId,
+        workspaceId
+      );
+    return this.getChangePlan(workspaceId, planId)!;
+  }
+
+  deleteChangePlan(workspaceId: string, planId: string): boolean {
+    const res = this.db
+      .prepare('DELETE FROM change_plans WHERE id = ? AND workspace_id = ?')
+      .run(planId, workspaceId);
+    return Number(res.changes) > 0;
   }
 
   updateChangePlanStatus(
@@ -828,7 +778,11 @@ class ControlPlaneStore {
     const rows = this.db
       .prepare('SELECT * FROM windows_agents WHERE workspace_id = ? ORDER BY created_at DESC')
       .all(workspaceId) as Array<Record<string, unknown>>;
-    return rows.map((r) => ({
+    return rows.map((r) => this.mapAgentRow(r));
+  }
+
+  private mapAgentRow(r: Record<string, unknown>): WindowsAgentRecord {
+    return {
       id: String(r.id),
       workspaceId: String(r.workspace_id),
       name: String(r.name),
@@ -838,7 +792,9 @@ class ControlPlaneStore {
       lastHeartbeatAt: r.last_heartbeat_at ? String(r.last_heartbeat_at) : null,
       pairingTokenPreview: String(r.pairing_token_preview),
       createdAt: String(r.created_at),
-    }));
+      osInfo: r.os_info ? String(r.os_info) : null,
+      discoveredInstancesCount: r.discovered_count !== undefined && r.discovered_count !== null ? Number(r.discovered_count) : 0,
+    };
   }
 
   createAgentPairing(workspaceId: string, name: string, hostname: string): {
@@ -874,10 +830,373 @@ class ControlPlaneStore {
     };
   }
 
+  authenticateAgentToken(token: string): WindowsAgentRecord | null {
+    const tokenHash = crypto.createHash('sha256').update(token.trim()).digest('hex');
+    const row = this.db
+      .prepare('SELECT * FROM windows_agents WHERE pairing_token_hash = ?')
+      .get(tokenHash) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapAgentRow(row);
+  }
+
+  updateAgentTelemetry(
+    agentId: string,
+    updates: {
+      status?: WindowsAgentRecord['status'];
+      hostname?: string;
+      version?: string;
+      osInfo?: string;
+      discoveredCount?: number;
+      lastHeartbeatAt?: string;
+    }
+  ): WindowsAgentRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM windows_agents WHERE id = ?')
+      .get(agentId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    this.db
+      .prepare(
+        `UPDATE windows_agents SET status = ?, hostname = ?, version = ?, os_info = ?, discovered_count = ?, last_heartbeat_at = ? WHERE id = ?`
+      )
+      .run(
+        updates.status ?? String(row.status),
+        updates.hostname ?? String(row.hostname),
+        updates.version ?? String(row.version),
+        updates.osInfo ?? (row.os_info ? String(row.os_info) : null),
+        updates.discoveredCount ?? Number(row.discovered_count ?? 0),
+        updates.lastHeartbeatAt ?? (row.last_heartbeat_at ? String(row.last_heartbeat_at) : null),
+        agentId
+      );
+    const updated = this.db.prepare('SELECT * FROM windows_agents WHERE id = ?').get(agentId) as Record<string, unknown>;
+    return this.mapAgentRow(updated);
+  }
+
   updateAgentStatus(workspaceId: string, agentId: string, status: WindowsAgentRecord['status']) {
     this.db
       .prepare('UPDATE windows_agents SET status = ? WHERE id = ? AND workspace_id = ?')
       .run(status, agentId, workspaceId);
+  }
+
+  // Authentication & Sessions
+  registerUser(input: { name: string; email: string; password: string; organizationName?: string }): {
+    user: AuthUser;
+    sessionId: string;
+    workspaceId: string;
+  } {
+    const cleanEmail = input.email.trim().toLowerCase();
+    const existing = this.db.prepare('SELECT id FROM users WHERE email = ?').get(cleanEmail);
+    if (existing) {
+      throw new Error('An account with that email already exists.');
+    }
+
+    const userId = `usr_${crypto.randomBytes(5).toString('hex')}`;
+    const workspaceId = `ws_${crypto.randomBytes(5).toString('hex')}`;
+    const now = new Date().toISOString();
+    const passHash = hashPassword(input.password);
+    const defaultPolicy: WorkspacePolicy = {
+      requireApprovalForProduction: true,
+      separationOfDuties: true,
+      requireMfaForPrivileged: false,
+      aiAssistantEnabled: false,
+      aiSchemaSharingConsent: false,
+      maxExportRows: 1000,
+    };
+
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      this.db
+        .prepare('INSERT INTO users (id, name, email, password_hash, created_at) VALUES (?, ?, ?, ?, ?)')
+        .run(userId, input.name.trim(), cleanEmail, passHash, now);
+
+      this.db
+        .prepare(
+          'INSERT INTO workspaces (id, organization_name, name, region, plan_tier, policy_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        )
+        .run(
+          workspaceId,
+          input.organizationName?.trim() || `${input.name.trim()} Org`,
+          'Primary Workspace',
+          'local-win11',
+          'free',
+          JSON.stringify(defaultPolicy),
+          now
+        );
+
+      this.db
+        .prepare(
+          'INSERT INTO members (id, workspace_id, name, email, role, schema_write, data_write, mfa_enabled, status, joined_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        )
+        .run(userId, workspaceId, input.name.trim(), cleanEmail, 'Owner', 1, 1, 0, 'active', now);
+
+      const sessionId = `ses_${crypto.randomBytes(16).toString('hex')}`;
+      const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+      this.db
+        .prepare('INSERT INTO auth_sessions (id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)')
+        .run(sessionId, userId, now, expiresAt);
+
+      this.db.exec('COMMIT;');
+      return {
+        user: { id: userId, name: input.name.trim(), email: cleanEmail, createdAt: now },
+        sessionId,
+        workspaceId,
+      };
+    } catch (err) {
+      this.db.exec('ROLLBACK;');
+      throw err;
+    }
+  }
+
+  loginUser(email: string, password: string): { user: AuthUser; sessionId: string; defaultWorkspaceId: string } {
+    const cleanEmail = email.trim().toLowerCase();
+    const row = this.db
+      .prepare('SELECT id, name, email, password_hash, created_at FROM users WHERE email = ?')
+      .get(cleanEmail) as Record<string, unknown> | undefined;
+    if (!row || !verifyPassword(password, String(row.password_hash))) {
+      throw new Error('Invalid email or password.');
+    }
+
+    const userId = String(row.id);
+    const sessionId = `ses_${crypto.randomBytes(16).toString('hex')}`;
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    this.db
+      .prepare('INSERT INTO auth_sessions (id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)')
+      .run(sessionId, userId, now, expiresAt);
+
+    const memberWs = this.db
+      .prepare('SELECT workspace_id FROM members WHERE id = ? OR email = ? LIMIT 1')
+      .get(userId, cleanEmail) as { workspace_id: string } | undefined;
+
+    return {
+      user: {
+        id: userId,
+        name: String(row.name),
+        email: String(row.email),
+        createdAt: String(row.created_at),
+      },
+      sessionId,
+      defaultWorkspaceId: memberWs?.workspace_id || 'ws_primary',
+    };
+  }
+
+  getUserBySessionId(sessionId: string): AuthUser | null {
+    const row = this.db
+      .prepare(
+        `SELECT u.id, u.name, u.email, u.created_at, s.expires_at
+         FROM auth_sessions s
+         INNER JOIN users u ON s.user_id = u.id
+         WHERE s.id = ?`
+      )
+      .get(sessionId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    if (Date.parse(String(row.expires_at)) < Date.now()) {
+      this.db.prepare('DELETE FROM auth_sessions WHERE id = ?').run(sessionId);
+      return null;
+    }
+    return {
+      id: String(row.id),
+      name: String(row.name),
+      email: String(row.email),
+      createdAt: String(row.created_at),
+    };
+  }
+
+  deleteSession(sessionId: string): void {
+    this.db.prepare('DELETE FROM auth_sessions WHERE id = ?').run(sessionId);
+  }
+
+  getMemberForUserInWorkspace(workspaceId: string, user: AuthUser): WorkspaceMember | null {
+    const row = this.db
+      .prepare('SELECT * FROM members WHERE workspace_id = ? AND (id = ? OR LOWER(email) = LOWER(?))')
+      .get(workspaceId, user.id, user.email) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      name: String(row.name),
+      email: String(row.email),
+      role: String(row.role) as WorkspaceRole,
+      schemaWrite: Boolean(row.schema_write),
+      dataWrite: Boolean(row.data_write),
+      mfaEnabled: Boolean(row.mfa_enabled),
+      status: String(row.status) as 'active' | 'suspended',
+      joinedAt: String(row.joined_at),
+    };
+  }
+
+  listWorkspacesForUser(user: AuthUser): Array<{ id: string; organizationName: string; name: string; planTier: PlanTier }> {
+    const rows = this.db
+      .prepare(
+        `SELECT w.id, w.organization_name, w.name, w.plan_tier
+         FROM workspaces w
+         INNER JOIN members m ON m.workspace_id = w.id
+         WHERE m.id = ? OR LOWER(m.email) = LOWER(?)
+         ORDER BY w.created_at ASC`
+      )
+      .all(user.id, user.email) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      id: String(r.id),
+      organizationName: String(r.organization_name),
+      name: String(r.name),
+      planTier: String(r.plan_tier) as PlanTier,
+    }));
+  }
+
+  // Invitations
+  listInvitations(workspaceId: string): WorkspaceInvitation[] {
+    const rows = this.db
+      .prepare('SELECT * FROM workspace_invitations WHERE workspace_id = ? ORDER BY created_at DESC')
+      .all(workspaceId) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      id: String(r.id),
+      workspaceId: String(r.workspace_id),
+      email: String(r.email),
+      name: String(r.name),
+      role: String(r.role) as WorkspaceRole,
+      tokenPreview: String(r.token_preview),
+      status: String(r.status) as WorkspaceInvitation['status'],
+      invitedByName: String(r.invited_by_name),
+      createdAt: String(r.created_at),
+      expiresAt: String(r.expires_at),
+    }));
+  }
+
+  createInvitation(
+    workspaceId: string,
+    input: { name: string; email: string; role: WorkspaceRole; invitedByName: string }
+  ): { invitation: WorkspaceInvitation; inviteToken: string } {
+    const id = `inv_${crypto.randomBytes(5).toString('hex')}`;
+    const inviteToken = `vds_inv_${crypto.randomBytes(14).toString('hex')}`;
+    const tokenHash = crypto.createHash('sha256').update(inviteToken).digest('hex');
+    const preview = `${inviteToken.slice(0, 11)}...${inviteToken.slice(-4)}`;
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
+    this.db
+      .prepare(
+        `INSERT INTO workspace_invitations (id, workspace_id, email, name, role, token_hash, token_preview, status, invited_by_name, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        id,
+        workspaceId,
+        input.email.trim().toLowerCase(),
+        input.name.trim(),
+        input.role,
+        tokenHash,
+        preview,
+        'pending',
+        input.invitedByName,
+        now,
+        expiresAt
+      );
+
+    return {
+      invitation: {
+        id,
+        workspaceId,
+        email: input.email.trim().toLowerCase(),
+        name: input.name.trim(),
+        role: input.role,
+        tokenPreview: preview,
+        status: 'pending',
+        invitedByName: input.invitedByName,
+        createdAt: now,
+        expiresAt,
+      },
+      inviteToken,
+    };
+  }
+
+  acceptInvitation(inviteToken: string, password: string): { member: WorkspaceMember; user: AuthUser; sessionId: string; workspaceId: string } {
+    const tokenHash = crypto.createHash('sha256').update(inviteToken.trim()).digest('hex');
+    const inv = this.db
+      .prepare('SELECT * FROM workspace_invitations WHERE token_hash = ? AND status = ?')
+      .get(tokenHash, 'pending') as Record<string, unknown> | undefined;
+    if (!inv) throw new Error('Invitation token is invalid or already used.');
+    if (Date.parse(String(inv.expires_at)) < Date.now()) {
+      throw new Error('Invitation token has expired.');
+    }
+
+    const email = String(inv.email).toLowerCase();
+    const name = String(inv.name);
+    const workspaceId = String(inv.workspace_id);
+    const role = String(inv.role) as WorkspaceRole;
+    const now = new Date().toISOString();
+
+    let userRow = this.db.prepare('SELECT * FROM users WHERE email = ?').get(email) as Record<string, unknown> | undefined;
+    let userId: string;
+    if (!userRow) {
+      userId = `usr_${crypto.randomBytes(5).toString('hex')}`;
+      this.db
+        .prepare('INSERT INTO users (id, name, email, password_hash, created_at) VALUES (?, ?, ?, ?, ?)')
+        .run(userId, name, email, hashPassword(password), now);
+    } else {
+      userId = String(userRow.id);
+    }
+
+    const schemaWrite = role === 'Owner' || role === 'Admin' || role === 'Designer' ? 1 : 0;
+    const dataWrite = role !== 'Viewer' ? 1 : 0;
+
+    const existingMember = this.db
+      .prepare('SELECT id FROM members WHERE workspace_id = ? AND LOWER(email) = LOWER(?)')
+      .get(workspaceId, email) as { id: string } | undefined;
+
+    if (!existingMember) {
+      this.db
+        .prepare(
+          'INSERT INTO members (id, workspace_id, name, email, role, schema_write, data_write, mfa_enabled, status, joined_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        )
+        .run(userId, workspaceId, name, email, role, schemaWrite, dataWrite, 0, 'active', now);
+    }
+
+    this.db.prepare('UPDATE workspace_invitations SET status = ? WHERE id = ?').run('accepted', String(inv.id));
+
+    const sessionId = `ses_${crypto.randomBytes(16).toString('hex')}`;
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    this.db
+      .prepare('INSERT INTO auth_sessions (id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)')
+      .run(sessionId, userId, now, expiresAt);
+
+    return {
+      member: {
+        id: existingMember?.id || userId,
+        name,
+        email,
+        role,
+        schemaWrite: Boolean(schemaWrite),
+        dataWrite: Boolean(dataWrite),
+        mfaEnabled: false,
+        status: 'active',
+        joinedAt: now,
+      },
+      user: { id: userId, name, email, createdAt: now },
+      sessionId,
+      workspaceId,
+    };
+  }
+
+  recordBillingEvent(session: BillingCheckoutSession) {
+    this.db
+      .prepare(
+        'INSERT INTO billing_events (id, workspace_id, provider, target_tier, status, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      )
+      .run(session.id, session.workspaceId, session.provider, session.targetTier, session.status, session.note, session.createdAt);
+  }
+
+  listBillingEvents(workspaceId: string): BillingCheckoutSession[] {
+    const rows = this.db
+      .prepare('SELECT * FROM billing_events WHERE workspace_id = ? ORDER BY created_at DESC LIMIT 20')
+      .all(workspaceId) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      id: String(r.id),
+      workspaceId: String(r.workspace_id),
+      provider: String(r.provider) as BillingCheckoutSession['provider'],
+      targetTier: String(r.target_tier) as PlanTier,
+      status: String(r.status) as BillingCheckoutSession['status'],
+      checkoutUrl: null,
+      note: String(r.note),
+      createdAt: String(r.created_at),
+    }));
   }
 
   private mapConnectionRow(r: Record<string, unknown>): ConnectionProfile {
@@ -887,13 +1206,17 @@ class ControlPlaneStore {
       name: String(r.name),
       method: String(r.method) as ConnectionProfile['method'],
       host: String(r.host),
+      instanceName: r.instance_name ? String(r.instance_name) : null,
       port: Number(r.port),
       database: String(r.database_name),
       authMethod: String(r.auth_method) as ConnectionProfile['authMethod'],
       username: String(r.username),
+      domain: r.domain ? String(r.domain) : null,
       encrypt: Boolean(r.encrypt),
       trustServerCertificate: Boolean(r.trust_cert),
       readOnly: Boolean(r.read_only),
+      timeoutMs: r.timeout_ms ? Number(r.timeout_ms) : 8000,
+      reconnectOnStartup: r.reconnect_on_startup !== undefined ? Boolean(r.reconnect_on_startup) : true,
       environment: String(r.environment) as ConnectionProfile['environment'],
       status: String(r.status) as ConnectionProfile['status'],
       engineVersion: String(r.engine_version),

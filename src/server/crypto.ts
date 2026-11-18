@@ -2,7 +2,9 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
+const DATA_DIR = process.env.VDS_DATA_DIR
+  ? path.resolve(process.env.VDS_DATA_DIR)
+  : path.resolve(process.cwd(), 'data');
 const KEY_PATH = path.join(DATA_DIR, '.vds-master.key');
 
 let cachedKey: Buffer | null = null;
@@ -60,3 +62,37 @@ export function redactSensitiveText(input: string): string {
     .replace(/(password|pwd|secret|token|apikey|api_key)\s*[:=]\s*[^\s;,&"']+/gi, '$1=[REDACTED]')
     .replace(/Server=[^;]+;.*?Password=[^;]+;/gi, '[REDACTED_CONNECTION_STRING]');
 }
+
+export function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `${salt}:${derived}`;
+}
+
+export function verifyPassword(password: string, storedHash: string): boolean {
+  const [salt, keyHex] = storedHash.split(':');
+  if (!salt || !keyHex) return false;
+  const expected = Buffer.from(keyHex, 'hex');
+  const actual = crypto.scryptSync(password, salt, 64);
+  if (expected.length !== actual.length) return false;
+  return crypto.timingSafeEqual(expected, actual);
+}
+
+export function signSessionToken(sessionId: string): string {
+  const key = getMasterKey();
+  const sig = crypto.createHmac('sha256', key).update(sessionId).digest('hex');
+  return `${sessionId}.${sig}`;
+}
+
+export function verifySessionToken(token: string): string | null {
+  const dot = token.indexOf('.');
+  if (dot <= 0) return null;
+  const sessionId = token.slice(0, dot);
+  const sig = token.slice(dot + 1);
+  const expected = crypto.createHmac('sha256', getMasterKey()).update(sessionId).digest('hex');
+  const sigBuf = Buffer.from(sig, 'utf8');
+  const expBuf = Buffer.from(expected, 'utf8');
+  if (sigBuf.length !== expBuf.length) return null;
+  return crypto.timingSafeEqual(sigBuf, expBuf) ? sessionId : null;
+}
+

@@ -4,8 +4,10 @@ import {
   FriendlyFieldType,
   PreflightReport,
   RiskLevel,
+  SchemaDriftReport,
   SchemaOperation,
   SchemaSnapshot,
+  SqlErrorExplanation,
   VisualQuerySpec,
 } from './types';
 
@@ -48,7 +50,7 @@ export const FRIENDLY_FIELD_TYPES: FieldTypeMapping[] = [
   {
     friendlyType: 'money',
     label: 'Currency / Money',
-    description: 'Financial amounts stored with exact 2-decimal precision.',
+    description: 'Financial amounts stored with exact precision.',
     tsqlType: 'DECIMAL(19,4)',
   },
   {
@@ -141,7 +143,12 @@ export function quoteSqliteQualifiedTable(schemaName: string, tableName: string)
   return `"${s.value}.${t.value}"`;
 }
 
-export function mapFriendlyToSqlServerType(field: FieldDraft): string {
+export function mapFriendlyToSqlServerType(field: {
+  friendlyType: FriendlyFieldType;
+  length?: number;
+  precision?: number;
+  scale?: number;
+}): string {
   switch (field.friendlyType) {
     case 'auto_id':
       return 'INT IDENTITY(1,1)';
@@ -320,7 +327,6 @@ export function compileOperationsPlan(
           `  ${quoteTsqlIdentifier(colCheck.value)} ${tsqlType} ${nullSql}${uniqueSql}${defaultSql}`
         );
 
-        // Sandbox SQLite DDL equivalent
         if (field.friendlyType === 'auto_id' || (field.isIdentity && field.isPrimaryKey)) {
           sqliteColDefs.push(`  ${quoteSqliteIdentifier(colCheck.value)} INTEGER PRIMARY KEY AUTOINCREMENT`);
         } else {
@@ -463,6 +469,47 @@ export function compileOperationsPlan(
       );
       elevateRisk('medium');
       explanations.push(`Adds field "${colCheck.value}" to ${fullTable}.`);
+    } else if (op.kind === 'ALTER_COLUMN') {
+      const schemaCheck = validateIdentifier(op.schemaName, 'Schema name');
+      const tableCheck = validateIdentifier(op.tableName, 'Table name');
+      const colCheck = validateIdentifier(op.columnName, 'Column name');
+      if (!schemaCheck.valid) throw new Error(schemaCheck.error);
+      if (!tableCheck.valid) throw new Error(tableCheck.error);
+      if (!colCheck.valid) throw new Error(colCheck.error);
+      if (op.friendlyType === 'auto_id') {
+        throw new Error('Cannot alter an existing column into an IDENTITY column via ALTER COLUMN.');
+      }
+
+      const fullTable = `${schemaCheck.value}.${tableCheck.value}`;
+      const existingTable = snapshot?.tables.find(
+        (t) => t.fullName.toLowerCase() === fullTable.toLowerCase()
+      );
+      const existingCol = existingTable?.columns.find(
+        (c) => c.name.toLowerCase() === colCheck.value.toLowerCase()
+      );
+      if (existingCol?.isPrimaryKey && op.nullable) {
+        passed = false;
+        checks.push({
+          name: 'Primary key nullability check',
+          status: 'fail',
+          detail: `Column "${colCheck.value}" belongs to the Primary Key and cannot be made NULL.`,
+        });
+      }
+      if (existingCol && !op.nullable && existingCol.nullable && (existingTable?.rowCountEstimate ?? 0) > 0) {
+        warnings.push(
+          `Tightening "${colCheck.value}" to NOT NULL on populated table ${fullTable} will fail if existing rows contain NULL values.`
+        );
+      }
+
+      const tsqlType = mapFriendlyToSqlServerType(op);
+      const nullSql = op.nullable ? 'NULL' : 'NOT NULL';
+      tsqlChunks.push(
+        `ALTER TABLE ${quoteTsqlIdentifier(schemaCheck.value)}.${quoteTsqlIdentifier(
+          tableCheck.value
+        )} ALTER COLUMN ${quoteTsqlIdentifier(colCheck.value)} ${tsqlType} ${nullSql};`
+      );
+      elevateRisk('high');
+      explanations.push(`Modifies column "${colCheck.value}" on ${fullTable} to ${tsqlType} ${nullSql}.`);
     } else if (op.kind === 'DROP_COLUMN') {
       const schemaCheck = validateIdentifier(op.schemaName, 'Schema name');
       const tableCheck = validateIdentifier(op.tableName, 'Table name');
@@ -613,9 +660,89 @@ export function compileOperationsPlan(
           )})\n` +
           `  ON DELETE ${op.onDelete} ON UPDATE ${op.onUpdate};`
       );
-      // Note: SQLite requires table rebuild for ALTER ADD CONSTRAINT, so sandbox records FK metadata safely
       explanations.push(
         `Links ${sSchema.value}.${sTable.value}.${sCol.value} to ${tSchema.value}.${tTable.value}.${tCol.value} (ON DELETE ${op.onDelete}).`
+      );
+    } else if (op.kind === 'DROP_FOREIGN_KEY') {
+      const cName = validateIdentifier(op.constraintName, 'Constraint name');
+      const sName = validateIdentifier(op.schemaName, 'Schema name');
+      const tName = validateIdentifier(op.tableName, 'Table name');
+      if (!cName.valid) throw new Error(cName.error);
+      if (!sName.valid) throw new Error(sName.error);
+      if (!tName.valid) throw new Error(tName.error);
+
+      elevateRisk('medium');
+      tsqlChunks.push(
+        `ALTER TABLE ${quoteTsqlIdentifier(sName.value)}.${quoteTsqlIdentifier(
+          tName.value
+        )} DROP CONSTRAINT ${quoteTsqlIdentifier(cName.value)};`
+      );
+      explanations.push(
+        `Removes foreign key constraint ${cName.value} from ${sName.value}.${tName.value}.`
+      );
+    } else if (op.kind === 'ADD_UNIQUE_CONSTRAINT') {
+      const cName = validateIdentifier(op.constraintName, 'Constraint name');
+      const sName = validateIdentifier(op.schemaName, 'Schema name');
+      const tName = validateIdentifier(op.tableName, 'Table name');
+      if (!cName.valid) throw new Error(cName.error);
+      if (!sName.valid) throw new Error(sName.error);
+      if (!tName.valid) throw new Error(tName.error);
+      if (!op.columns || op.columns.length === 0) throw new Error('Select at least one column for unique constraint.');
+
+      elevateRisk('low');
+      tsqlChunks.push(
+        `ALTER TABLE ${quoteTsqlIdentifier(sName.value)}.${quoteTsqlIdentifier(
+          tName.value
+        )} ADD CONSTRAINT ${quoteTsqlIdentifier(cName.value)} UNIQUE (${op.columns
+          .map(quoteTsqlIdentifier)
+          .join(', ')});`
+      );
+      sqliteStatements.push(
+        `CREATE UNIQUE INDEX ${quoteSqliteIdentifier(cName.value)} ON ${quoteSqliteQualifiedTable(
+          sName.value,
+          tName.value
+        )} (${op.columns.map(quoteSqliteIdentifier).join(', ')});`
+      );
+      explanations.push(
+        `Adds unique constraint ${cName.value} on ${sName.value}.${tName.value} (${op.columns.join(', ')}).`
+      );
+    } else if (op.kind === 'ADD_PRIMARY_KEY') {
+      const cName = validateIdentifier(op.constraintName, 'Constraint name');
+      const sName = validateIdentifier(op.schemaName, 'Schema name');
+      const tName = validateIdentifier(op.tableName, 'Table name');
+      if (!cName.valid) throw new Error(cName.error);
+      if (!sName.valid) throw new Error(sName.error);
+      if (!tName.valid) throw new Error(tName.error);
+      if (!op.columns || op.columns.length === 0) throw new Error('Select at least one column for Primary Key.');
+
+      elevateRisk('medium');
+      tsqlChunks.push(
+        `ALTER TABLE ${quoteTsqlIdentifier(sName.value)}.${quoteTsqlIdentifier(
+          tName.value
+        )} ADD CONSTRAINT ${quoteTsqlIdentifier(cName.value)} PRIMARY KEY CLUSTERED (${op.columns
+          .map(quoteTsqlIdentifier)
+          .join(', ')});`
+      );
+      explanations.push(
+        `Defines Primary Key ${cName.value} on ${sName.value}.${tName.value} (${op.columns.join(', ')}).`
+      );
+    } else if (op.kind === 'DROP_CONSTRAINT') {
+      const cName = validateIdentifier(op.constraintName, 'Constraint name');
+      const sName = validateIdentifier(op.schemaName, 'Schema name');
+      const tName = validateIdentifier(op.tableName, 'Table name');
+      if (!cName.valid) throw new Error(cName.error);
+      if (!sName.valid) throw new Error(sName.error);
+      if (!tName.valid) throw new Error(tName.error);
+
+      elevateRisk('high');
+      requiresConfirmText = `DROP ${cName.value}`;
+      tsqlChunks.push(
+        `ALTER TABLE ${quoteTsqlIdentifier(sName.value)}.${quoteTsqlIdentifier(
+          tName.value
+        )} DROP CONSTRAINT ${quoteTsqlIdentifier(cName.value)};`
+      );
+      explanations.push(
+        `Drops constraint ${cName.value} from ${sName.value}.${tName.value}.`
       );
     } else if (op.kind === 'CREATE_INDEX') {
       const idxName = validateIdentifier(op.indexName, 'Index name');
@@ -645,6 +772,66 @@ export function compileOperationsPlan(
       explanations.push(
         `Creates ${op.isUnique ? 'unique ' : ''}index ${idxName.value} on ${sName.value}.${tName.value} (${op.columns.join(', ')}).`
       );
+    } else if (op.kind === 'DROP_INDEX') {
+      const idxName = validateIdentifier(op.indexName, 'Index name');
+      const sName = validateIdentifier(op.schemaName, 'Schema name');
+      const tName = validateIdentifier(op.tableName, 'Table name');
+      if (!idxName.valid) throw new Error(idxName.error);
+      if (!sName.valid) throw new Error(sName.error);
+      if (!tName.valid) throw new Error(tName.error);
+
+      elevateRisk('medium');
+      tsqlChunks.push(
+        `DROP INDEX ${quoteTsqlIdentifier(idxName.value)} ON ${quoteTsqlIdentifier(
+          sName.value
+        )}.${quoteTsqlIdentifier(tName.value)};`
+      );
+      sqliteStatements.push(`DROP INDEX IF EXISTS ${quoteSqliteIdentifier(idxName.value)};`);
+      explanations.push(`Drops index ${idxName.value} from ${sName.value}.${tName.value}.`);
+    } else if (op.kind === 'RENAME_OBJECT') {
+      const sName = validateIdentifier(op.schemaName, 'Schema name');
+      const tName = validateIdentifier(op.tableName, 'Table name');
+      const newCheck = validateIdentifier(op.newName, 'New name');
+      if (!sName.valid) throw new Error(sName.error);
+      if (!tName.valid) throw new Error(tName.error);
+      if (!newCheck.valid) throw new Error(newCheck.error);
+
+      elevateRisk('medium');
+      if (op.columnName) {
+        const cCheck = validateIdentifier(op.columnName, 'Column name');
+        if (!cCheck.valid) throw new Error(cCheck.error);
+        tsqlChunks.push(
+          `EXEC sp_rename N'${sName.value}.${tName.value}.${cCheck.value}', N'${newCheck.value}', N'COLUMN';`
+        );
+        sqliteStatements.push(
+          `ALTER TABLE ${quoteSqliteQualifiedTable(sName.value, tName.value)} RENAME COLUMN ${quoteSqliteIdentifier(
+            cCheck.value
+          )} TO ${quoteSqliteIdentifier(newCheck.value)};`
+        );
+        explanations.push(
+          `Renames column ${sName.value}.${tName.value}.${cCheck.value} to ${newCheck.value}.`
+        );
+      } else {
+        tsqlChunks.push(
+          `EXEC sp_rename N'${sName.value}.${tName.value}', N'${newCheck.value}';`
+        );
+        sqliteStatements.push(
+          `ALTER TABLE ${quoteSqliteQualifiedTable(sName.value, tName.value)} RENAME TO ${quoteSqliteQualifiedTable(
+            sName.value,
+            newCheck.value
+          )};`
+        );
+        explanations.push(`Renames table ${sName.value}.${tName.value} to ${sName.value}.${newCheck.value}.`);
+      }
+    } else if (op.kind === 'CREATE_DATABASE') {
+      const dbCheck = validateIdentifier(op.databaseName, 'Database name');
+      if (!dbCheck.valid) throw new Error(dbCheck.error);
+      const collationSql = op.collation && validateIdentifier(op.collation, 'Collation').valid
+        ? ` COLLATE ${op.collation.trim()}`
+        : '';
+      elevateRisk('medium');
+      tsqlChunks.push(`CREATE DATABASE ${quoteTsqlIdentifier(dbCheck.value)}${collationSql};`);
+      explanations.push(`Creates SQL Server database ${dbCheck.value}.`);
     }
   }
 
@@ -672,23 +859,67 @@ export function compileVisualQuery(
   const tCheck = validateIdentifier(spec.tableName, 'Table');
   if (!sCheck.valid) throw new Error(sCheck.error);
   if (!tCheck.valid) throw new Error(tCheck.error);
-  if (!spec.columns || spec.columns.length === 0) {
-    throw new Error('Select at least one column to query.');
+
+  const hasAggregates = Boolean(spec.aggregates && spec.aggregates.length > 0);
+  if ((!spec.columns || spec.columns.length === 0) && !hasAggregates) {
+    throw new Error('Select at least one column or aggregate to query.');
   }
 
   const q = dialect === 'tsql' ? quoteTsqlIdentifier : quoteSqliteIdentifier;
-  const colList = spec.columns.map((c) => q(c)).join(', ');
-  const fromClause =
+  const baseRef =
     dialect === 'tsql'
       ? `${q(sCheck.value)}.${q(tCheck.value)}`
       : quoteSqliteQualifiedTable(sCheck.value, tCheck.value);
+  const baseAlias = 't0';
+
+  const hasJoins = Boolean(spec.joins && spec.joins.length > 0);
+  const qualifyBaseCol = (col: string) =>
+    hasJoins ? `${baseAlias}.${q(col)}` : q(col);
+
+  const selectItems: string[] = [];
+  for (const col of spec.columns || []) {
+    if (col.includes('.')) {
+      const [tbl, colName] = col.split('.', 2);
+      selectItems.push(`${q(tbl)}.${q(colName)}`);
+    } else {
+      selectItems.push(qualifyBaseCol(col));
+    }
+  }
+
+  if (spec.aggregates) {
+    for (const agg of spec.aggregates) {
+      const aliasCheck = validateIdentifier(agg.alias, 'Aggregate alias');
+      if (!aliasCheck.valid) throw new Error(aliasCheck.error);
+      const colExpr = agg.column === '*' ? '*' : qualifyBaseCol(agg.column);
+      selectItems.push(`${agg.func}(${colExpr}) AS ${q(aliasCheck.value)}`);
+    }
+  }
+
+  let joinSql = '';
+  if (spec.joins && spec.joins.length > 0) {
+    joinSql = spec.joins
+      .map((j, idx) => {
+        const js = validateIdentifier(j.targetSchema, 'Joined schema');
+        const jt = validateIdentifier(j.targetTable, 'Joined table');
+        if (!js.valid) throw new Error(js.error);
+        if (!jt.valid) throw new Error(jt.error);
+        const jAlias = `j${idx + 1}`;
+        const jTableSql =
+          dialect === 'tsql'
+            ? `${q(js.value)}.${q(jt.value)}`
+            : quoteSqliteQualifiedTable(js.value, jt.value);
+        const joinKw = j.joinType === 'LEFT' ? 'LEFT JOIN' : 'INNER JOIN';
+        return `\n${joinKw} ${jTableSql} AS ${jAlias} ON ${baseAlias}.${q(j.sourceColumn)} = ${jAlias}.${q(j.targetColumn)}`;
+      })
+      .join('');
+  }
 
   const whereParts: string[] = [];
   const params: Record<string, unknown> = {};
   const orderedParams: unknown[] = [];
 
   spec.filters.forEach((f, idx) => {
-    const colSql = q(f.column);
+    const colSql = qualifyBaseCol(f.column);
     const paramName = `p${idx}`;
     if (f.operator === 'is_null') {
       whereParts.push(`${colSql} IS NULL`);
@@ -721,21 +952,26 @@ export function compileVisualQuery(
     }
   });
 
-  const safeLimit = Math.min(Math.max(Math.floor(spec.limit || 50), 1), 500);
+  const safeLimit = Math.min(Math.max(Math.floor(spec.limit || 50), 1), 1000);
   const whereSql = whereParts.length > 0 ? `\nWHERE ${whereParts.join(' AND ')}` : '';
+  const groupSql =
+    spec.groupBy && spec.groupBy.length > 0
+      ? `\nGROUP BY ${spec.groupBy.map(qualifyBaseCol).join(', ')}`
+      : '';
   const orderSql = spec.orderBy
-    ? `\nORDER BY ${q(spec.orderBy.column)} ${spec.orderBy.direction === 'DESC' ? 'DESC' : 'ASC'}`
+    ? `\nORDER BY ${qualifyBaseCol(spec.orderBy.column)} ${spec.orderBy.direction === 'DESC' ? 'DESC' : 'ASC'}`
     : '';
+  const fromClause = hasJoins ? `${baseRef} AS ${baseAlias}${joinSql}` : baseRef;
 
   if (dialect === 'tsql') {
     return {
-      sql: `SELECT TOP (${safeLimit}) ${colList}\nFROM ${fromClause}${whereSql}${orderSql};`,
+      sql: `SELECT TOP (${safeLimit}) ${selectItems.join(', ')}\nFROM ${fromClause}${whereSql}${groupSql}${orderSql};`,
       params,
       orderedParams,
     };
   }
   return {
-    sql: `SELECT ${colList}\nFROM ${fromClause}${whereSql}${orderSql}\nLIMIT ${safeLimit};`,
+    sql: `SELECT ${selectItems.join(', ')}\nFROM ${fromClause}${whereSql}${groupSql}${orderSql}\nLIMIT ${safeLimit};`,
     params,
     orderedParams,
   };
@@ -758,7 +994,6 @@ export function validateSqlStatement(
     return { valid: false, statementType: 'SELECT', error: 'Enter a SQL statement before running.' };
   }
 
-  // Disallow multi-statement injection batches from the ad-hoc editor
   const withoutTrailingSemi = cleaned.replace(/;+$/, '');
   if (withoutTrailingSemi.includes(';')) {
     return {
@@ -798,6 +1033,353 @@ export function validateSqlStatement(
   return { valid: true, statementType: 'MUTATION' };
 }
 
+export function formatSql(rawSql: string): string {
+  const trimmed = rawSql.trim();
+  if (!trimmed) return '';
+
+  // Tokenize preserving single-quoted strings and bracketed identifiers
+  const tokens: Array<{ type: 'literal' | 'code'; value: string }> = [];
+  let idx = 0;
+  let buf = '';
+  while (idx < trimmed.length) {
+    const ch = trimmed[idx];
+    if (ch === "'" || ch === '[' || ch === '"') {
+      if (buf) {
+        tokens.push({ type: 'code', value: buf });
+        buf = '';
+      }
+      const endCh = ch === '[' ? ']' : ch;
+      let end = idx + 1;
+      while (end < trimmed.length) {
+        if (trimmed[end] === endCh) {
+          if (ch === "'" && trimmed[end + 1] === "'") {
+            end += 2;
+            continue;
+          }
+          end += 1;
+          break;
+        }
+        end += 1;
+      }
+      tokens.push({ type: 'literal', value: trimmed.slice(idx, end) });
+      idx = end;
+    } else {
+      buf += ch;
+      idx += 1;
+    }
+  }
+  if (buf) tokens.push({ type: 'code', value: buf });
+
+  const majorKeywords = [
+    'SELECT',
+    'FROM',
+    'INNER JOIN',
+    'LEFT JOIN',
+    'RIGHT JOIN',
+    'FULL JOIN',
+    'JOIN',
+    'WHERE',
+    'GROUP BY',
+    'HAVING',
+    'ORDER BY',
+    'OFFSET',
+    'UNION ALL',
+    'UNION',
+    'INSERT INTO',
+    'VALUES',
+    'UPDATE',
+    'SET',
+    'DELETE FROM',
+  ];
+
+  const upperWords = new Set([
+    ...majorKeywords,
+    'AS',
+    'ON',
+    'AND',
+    'OR',
+    'NOT',
+    'NULL',
+    'IS',
+    'IN',
+    'LIKE',
+    'TOP',
+    'DISTINCT',
+    'COUNT',
+    'SUM',
+    'AVG',
+    'MIN',
+    'MAX',
+    'ASC',
+    'DESC',
+    'CASE',
+    'WHEN',
+    'THEN',
+    'ELSE',
+    'END',
+    'WITH',
+    'ROWS',
+    'FETCH',
+    'NEXT',
+    'ONLY',
+    'LIMIT',
+  ]);
+
+  let formatted = tokens
+    .map((tok) => {
+      if (tok.type === 'literal') return tok.value;
+      let text = tok.value.replace(/\s+/g, ' ');
+      for (const kw of upperWords) {
+        const re = new RegExp(`\\b${kw.replace(/\s+/g, '\\s+')}\\b`, 'gi');
+        text = text.replace(re, kw);
+      }
+      return text;
+    })
+    .join('');
+
+  for (const kw of majorKeywords) {
+    const re = new RegExp(`\\s+(${kw.replace(/\s+/g, '\\s+')})\\b`, 'g');
+    formatted = formatted.replace(re, `\n$1`);
+  }
+  formatted = formatted
+    .replace(/\s+\b(AND|OR)\b\s+/g, '\n  $1 ')
+    .replace(/\s*,\s*/g, ', ')
+    .replace(/\n{2,}/g, '\n')
+    .trim();
+
+  return formatted;
+}
+
+export function explainSqlError(rawError: string): SqlErrorExplanation {
+  const msg = rawError || '';
+
+  if (/18456|Login failed for user/i.test(msg)) {
+    return {
+      code: 18456,
+      title: 'SQL Server Login Rejected',
+      summary: 'SQL Server rejected the username, password, or login authentication mode.',
+      suggestion:
+        'Verify Mixed Mode Authentication is enabled on SQL Server for SQL logins, check username/password, or switch to Windows Authentication.',
+    };
+  }
+  if (/208|Invalid object name|no such table/i.test(msg)) {
+    return {
+      code: 208,
+      title: 'Table or View Not Found',
+      summary: 'The referenced schema, table, or view does not exist in the active database.',
+      suggestion:
+        'Refresh schema metadata, verify the schema prefix (for example [dbo].[TableName]), and ensure you connected to the intended database.',
+    };
+  }
+  if (/207|Invalid column name|no such column/i.test(msg)) {
+    return {
+      code: 207,
+      title: 'Unknown Column Name',
+      summary: 'One or more columns referenced in your query or filter do not exist in the table.',
+      suggestion: 'Check column spelling and casing in Database Explorer before re-running.',
+    };
+  }
+  if (/547|FOREIGN KEY constraint|conflicted with the REFERENCE constraint/i.test(msg)) {
+    return {
+      code: 547,
+      title: 'Foreign Key Referential Integrity Conflict',
+      summary: 'This insert, update, or delete violates a parent/child Foreign Key relationship.',
+      suggestion:
+        'Ensure referenced parent IDs exist first, or update/remove child records before deleting the parent record.',
+    };
+  }
+  if (/2627|2601|UNIQUE constraint|duplicate key/i.test(msg)) {
+    return {
+      code: 2627,
+      title: 'Duplicate Primary or Unique Key',
+      summary: 'A record with the same Primary Key or Unique column value already exists.',
+      suggestion: 'Provide a distinct key value or edit the existing row instead of inserting a duplicate.',
+    };
+  }
+  if (/515|Cannot insert the value NULL|NOT NULL constraint/i.test(msg)) {
+    return {
+      code: 515,
+      title: 'Required Field Cannot Be Empty (NULL)',
+      summary: 'A column marked NOT NULL without a default value was omitted or left blank.',
+      suggestion: 'Fill in all required fields marked NOT NULL before saving.',
+    };
+  }
+  if (/229|permission was denied/i.test(msg)) {
+    return {
+      code: 229,
+      title: 'Insufficient SQL Server Permissions',
+      summary: 'Your SQL Server login lacks SELECT, INSERT, UPDATE, DELETE, or ALTER permissions on this object.',
+      suggestion: 'Request least-privilege grant on the schema/table from your DBA or connect with an authorized role.',
+    };
+  }
+  if (/certificate|self signed|TLS|SSL/i.test(msg)) {
+    return {
+      code: null,
+      title: 'TLS Certificate Validation Failed',
+      summary: 'The SQL Server TLS certificate is untrusted, expired, or does not match the hostname.',
+      suggestion:
+        'Install a trusted CA certificate on SQL Server, or for local/dev instances explicitly opt into "Trust self-signed server certificate".',
+    };
+  }
+  if (/ETIMEDOUT|ECONNREFUSED|ESOCKET|timeout|Unreachable/i.test(msg)) {
+    return {
+      code: null,
+      title: 'Network Reachability or Timeout Error',
+      summary: 'Could not reach the SQL Server TCP port or query exceeded the configured timeout.',
+      suggestion:
+        'Verify SQL Server TCP/IP is enabled, check Windows Firewall port 1433 / SQL Browser UDP 1434, or route through the Windows Connector Agent.',
+    };
+  }
+
+  return {
+    code: null,
+    title: 'Database Execution Error',
+    summary: msg || 'The database engine returned an error executing the statement.',
+    suggestion: 'Inspect the SQL syntax, table names, permissions, and connection state before retrying.',
+  };
+}
+
+export function diffSchemaSnapshots(
+  targetFingerprint: string,
+  baselineSnapshot: SchemaSnapshot | null,
+  liveSnapshot: SchemaSnapshot
+): SchemaDriftReport {
+  const checkedAt = new Date().toISOString();
+  if (targetFingerprint === liveSnapshot.fingerprint) {
+    return {
+      drifted: false,
+      targetFingerprint,
+      liveFingerprint: liveSnapshot.fingerprint,
+      checkedAt,
+      addedTables: [],
+      removedTables: [],
+      changedTables: [],
+      summary: 'No schema drift detected. Live database metadata matches the staged plan fingerprint.',
+    };
+  }
+
+  if (!baselineSnapshot) {
+    return {
+      drifted: true,
+      targetFingerprint,
+      liveFingerprint: liveSnapshot.fingerprint,
+      checkedAt,
+      addedTables: [],
+      removedTables: [],
+      changedTables: [],
+      summary: `Schema fingerprint changed (${targetFingerprint} -> ${liveSnapshot.fingerprint}). Re-validate plan against live metadata.`,
+    };
+  }
+
+  const baseMap = new Map(baselineSnapshot.tables.map((t) => [t.fullName.toLowerCase(), t]));
+  const liveMap = new Map(liveSnapshot.tables.map((t) => [t.fullName.toLowerCase(), t]));
+
+  const addedTables: string[] = [];
+  const removedTables: string[] = [];
+  const changedTables: SchemaDriftReport['changedTables'] = [];
+
+  for (const [k, liveTbl] of liveMap.entries()) {
+    const baseTbl = baseMap.get(k);
+    if (!baseTbl) {
+      addedTables.push(liveTbl.fullName);
+      continue;
+    }
+    const baseCols = new Map(baseTbl.columns.map((c) => [c.name.toLowerCase(), c]));
+    const liveCols = new Map(liveTbl.columns.map((c) => [c.name.toLowerCase(), c]));
+    const addedColumns: string[] = [];
+    const removedColumns: string[] = [];
+    const alteredColumns: string[] = [];
+
+    for (const [ck, lc] of liveCols.entries()) {
+      const bc = baseCols.get(ck);
+      if (!bc) addedColumns.push(lc.name);
+      else if (bc.sqlType !== lc.sqlType || bc.nullable !== lc.nullable) alteredColumns.push(lc.name);
+    }
+    for (const [ck, bc] of baseCols.entries()) {
+      if (!liveCols.has(ck)) removedColumns.push(bc.name);
+    }
+
+    if (addedColumns.length || removedColumns.length || alteredColumns.length) {
+      changedTables.push({
+        fullName: liveTbl.fullName,
+        addedColumns,
+        removedColumns,
+        alteredColumns,
+      });
+    }
+  }
+
+  for (const [k, baseTbl] of baseMap.entries()) {
+    if (!liveMap.has(k)) removedTables.push(baseTbl.fullName);
+  }
+
+  return {
+    drifted: true,
+    targetFingerprint,
+    liveFingerprint: liveSnapshot.fingerprint,
+    checkedAt,
+    addedTables,
+    removedTables,
+    changedTables,
+    summary: `Drift detected (${targetFingerprint} -> ${liveSnapshot.fingerprint}): ${addedTables.length} added table(s), ${removedTables.length} removed table(s), ${changedTables.length} modified table(s).`,
+  };
+}
+
+export function generateSchemaMarkdownDocs(snapshot: SchemaSnapshot): string {
+  const lines: string[] = [
+    `# Database Data Dictionary: ${snapshot.databaseName}`,
+    '',
+    `- **Engine**: ${snapshot.engineVersion}`,
+    `- **Captured At**: ${snapshot.capturedAt}`,
+    `- **Schema Fingerprint**: \`${snapshot.fingerprint}\``,
+    `- **Tables & Views**: ${snapshot.tables.length}`,
+    '',
+  ];
+
+  for (const table of snapshot.tables) {
+    lines.push(`## ${table.fullName} (${table.objectType})`);
+    lines.push('');
+    lines.push(`- Estimated Rows: ${table.rowCountEstimate.toLocaleString()}`);
+    lines.push(`- Primary Key: ${table.primaryKeyColumns.length ? table.primaryKeyColumns.join(', ') : 'None'}`);
+    lines.push('');
+    lines.push('| Column | SQL Type | Friendly Type | Nullable | Keys / Flags | Default |');
+    lines.push('| --- | --- | --- | --- | --- | --- |');
+    for (const col of table.columns) {
+      const flags = [
+        col.isPrimaryKey ? 'PK' : '',
+        col.isIdentity ? 'IDENTITY' : '',
+        col.isUnique && !col.isPrimaryKey ? 'UNIQUE' : '',
+      ]
+        .filter(Boolean)
+        .join(', ');
+      lines.push(
+        `| ${col.name} | \`${col.sqlType}\` | ${col.friendlyType} | ${col.nullable ? 'YES' : 'NO'} | ${flags || '-'} | ${col.defaultValue ?? '-'} |`
+      );
+    }
+    if (table.foreignKeys.length > 0) {
+      lines.push('');
+      lines.push('**Relationships:**');
+      for (const fk of table.foreignKeys) {
+        lines.push(
+          `- \`${fk.name}\`: \`${fk.sourceColumn}\` -> \`${fk.targetSchema}.${fk.targetTable}.${fk.targetColumn}\` (ON DELETE ${fk.onDelete})`
+        );
+      }
+    }
+    if (table.indexes.length > 0) {
+      lines.push('');
+      lines.push('**Indexes:**');
+      for (const idx of table.indexes) {
+        lines.push(
+          `- \`${idx.name}\` (${idx.type}${idx.isUnique ? ', UNIQUE' : ''}): \`${idx.columns.join(', ')}\``
+        );
+      }
+    }
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}
+
 export async function computeDeterministicDigest(payload: string): Promise<string> {
   if (typeof globalThis.crypto !== 'undefined' && globalThis.crypto.subtle) {
     const bytes = new TextEncoder().encode(payload);
@@ -807,7 +1389,6 @@ export async function computeDeterministicDigest(payload: string): Promise<strin
       .join('')
       .slice(0, 16);
   }
-  // Fallback FNV-1a deterministic 64-bit hex if subtle unavailable
   let h = 0xcbf29ce484222325n;
   for (let i = 0; i < payload.length; i += 1) {
     h ^= BigInt(payload.charCodeAt(i));

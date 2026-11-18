@@ -11,7 +11,6 @@ import { api } from '../lib/api';
 import {
   compileOperationsPlan,
   FRIENDLY_FIELD_TYPES,
-  mapFriendlyToSqlServerType,
 } from '../shared/sqlCompiler';
 import {
   AppMode,
@@ -31,6 +30,16 @@ interface TableDesignerPageProps {
   onNavigate: (nav: NavSection) => void;
   onToast: (tone: 'success' | 'error' | 'info', title: string, detail?: string) => void;
 }
+
+type AlterOperationKind =
+  | 'ADD_COLUMN'
+  | 'ALTER_COLUMN'
+  | 'DROP_COLUMN'
+  | 'ADD_PRIMARY_KEY'
+  | 'ADD_UNIQUE_CONSTRAINT'
+  | 'DROP_CONSTRAINT'
+  | 'CREATE_INDEX'
+  | 'DROP_INDEX';
 
 const STARTER_TEMPLATES: Record<string, { tableName: string; fields: FieldDraft[] }> = {
   blank: {
@@ -94,7 +103,7 @@ export function TableDesignerPage({
 
   // Alter existing table state
   const [alterTableKey, setAlterTableKey] = useState(snapshot?.tables[0]?.fullName ?? '');
-  const [alterKind, setAlterKind] = useState<'ADD_COLUMN' | 'DROP_COLUMN'>('ADD_COLUMN');
+  const [alterKind, setAlterKind] = useState<AlterOperationKind>('ADD_COLUMN');
   const [newCol, setNewCol] = useState<FieldDraft>({
     id: 'alter_col',
     name: '',
@@ -105,7 +114,14 @@ export function TableDesignerPage({
     isIdentity: false,
     isUnique: false,
   });
+  const [alterColName, setAlterColName] = useState('');
+  const [alterColType, setAlterColType] = useState<FriendlyFieldType>('text');
+  const [alterColLength, setAlterColLength] = useState<number>(200);
+  const [alterColNullable, setAlterColNullable] = useState<boolean>(true);
   const [dropColName, setDropColName] = useState('');
+  const [constraintName, setConstraintName] = useState('');
+  const [selectedConstraintCols, setSelectedConstraintCols] = useState<string[]>([]);
+  const [uniqueIndexFlag, setUniqueIndexFlag] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   const alterTargetTable =
@@ -123,25 +139,117 @@ export function TableDesignerPage({
       ];
     }
     if (!alterTargetTable) return [];
-    if (alterKind === 'ADD_COLUMN') {
-      return [
-        {
-          kind: 'ADD_COLUMN',
-          schemaName: alterTargetTable.schemaName,
-          tableName: alterTargetTable.tableName,
-          field: { ...newCol, name: newCol.name || 'NewColumn' },
-        },
-      ];
+    const fallbackCol = alterTargetTable.columns[0]?.name ?? 'Column';
+    const pickedCols =
+      selectedConstraintCols.length > 0 ? selectedConstraintCols : [fallbackCol];
+
+    switch (alterKind) {
+      case 'ADD_COLUMN':
+        return [
+          {
+            kind: 'ADD_COLUMN',
+            schemaName: alterTargetTable.schemaName,
+            tableName: alterTargetTable.tableName,
+            field: { ...newCol, name: newCol.name || 'NewColumn' },
+          },
+        ];
+      case 'ALTER_COLUMN':
+        return [
+          {
+            kind: 'ALTER_COLUMN',
+            schemaName: alterTargetTable.schemaName,
+            tableName: alterTargetTable.tableName,
+            columnName: alterColName || fallbackCol,
+            friendlyType: alterColType,
+            length: alterColType === 'text' ? alterColLength : undefined,
+            nullable: alterColNullable,
+          },
+        ];
+      case 'DROP_COLUMN':
+        return [
+          {
+            kind: 'DROP_COLUMN',
+            schemaName: alterTargetTable.schemaName,
+            tableName: alterTargetTable.tableName,
+            columnName:
+              dropColName ||
+              alterTargetTable.columns[alterTargetTable.columns.length - 1]?.name ||
+              'Column',
+          },
+        ];
+      case 'ADD_PRIMARY_KEY':
+        return [
+          {
+            kind: 'ADD_PRIMARY_KEY',
+            constraintName:
+              constraintName.trim() || `PK_${alterTargetTable.tableName}_${pickedCols[0]}`,
+            schemaName: alterTargetTable.schemaName,
+            tableName: alterTargetTable.tableName,
+            columns: pickedCols,
+          },
+        ];
+      case 'ADD_UNIQUE_CONSTRAINT':
+        return [
+          {
+            kind: 'ADD_UNIQUE_CONSTRAINT',
+            constraintName:
+              constraintName.trim() || `UQ_${alterTargetTable.tableName}_${pickedCols.join('_')}`,
+            schemaName: alterTargetTable.schemaName,
+            tableName: alterTargetTable.tableName,
+            columns: pickedCols,
+          },
+        ];
+      case 'DROP_CONSTRAINT':
+        return [
+          {
+            kind: 'DROP_CONSTRAINT',
+            constraintName: constraintName.trim() || 'ConstraintName',
+            schemaName: alterTargetTable.schemaName,
+            tableName: alterTargetTable.tableName,
+          },
+        ];
+      case 'CREATE_INDEX':
+        return [
+          {
+            kind: 'CREATE_INDEX',
+            indexName:
+              constraintName.trim() || `IX_${alterTargetTable.tableName}_${pickedCols.join('_')}`,
+            schemaName: alterTargetTable.schemaName,
+            tableName: alterTargetTable.tableName,
+            columns: pickedCols,
+            isUnique: uniqueIndexFlag,
+          },
+        ];
+      case 'DROP_INDEX':
+        return [
+          {
+            kind: 'DROP_INDEX',
+            indexName:
+              constraintName.trim() ||
+              alterTargetTable.indexes[0]?.name ||
+              `IX_${alterTargetTable.tableName}`,
+            schemaName: alterTargetTable.schemaName,
+            tableName: alterTargetTable.tableName,
+          },
+        ];
     }
-    return [
-      {
-        kind: 'DROP_COLUMN',
-        schemaName: alterTargetTable.schemaName,
-        tableName: alterTargetTable.tableName,
-        columnName: dropColName || alterTargetTable.columns[alterTargetTable.columns.length - 1]?.name || 'Column',
-      },
-    ];
-  }, [designAction, schemaName, tableName, fields, alterTargetTable, alterKind, newCol, dropColName]);
+  }, [
+    designAction,
+    schemaName,
+    tableName,
+    fields,
+    alterTargetTable,
+    alterKind,
+    newCol,
+    alterColName,
+    alterColType,
+    alterColLength,
+    alterColNullable,
+    dropColName,
+    constraintName,
+    selectedConstraintCols,
+    uniqueIndexFlag,
+  ]);
 
   const previewResult = useMemo(() => {
     if (operations.length === 0) return { ok: false as const, error: 'Select a target table.' };
@@ -149,7 +257,10 @@ export function TableDesignerPage({
       const compiled = compileOperationsPlan(operations, snapshot);
       return { ok: true as const, compiled };
     } catch (err) {
-      return { ok: false as const, error: err instanceof Error ? err.message : 'Invalid field configuration.' };
+      return {
+        ok: false as const,
+        error: err instanceof Error ? err.message : 'Invalid field configuration.',
+      };
     }
   }, [operations, snapshot]);
 
@@ -230,9 +341,7 @@ export function TableDesignerPage({
       const title =
         designAction === 'create'
           ? `Create table ${schemaName}.${tableName.trim()}`
-          : alterKind === 'ADD_COLUMN'
-          ? `Add field ${newCol.name.trim()} to ${alterTargetTable?.fullName}`
-          : `Drop field ${dropColName} from ${alterTargetTable?.fullName}`;
+          : `${alterKind.replace(/_/g, ' ')} on ${alterTargetTable?.fullName}`;
       await api.createPlan(connection.id, title, operations);
       await onPlanCreated();
       onToast('success', 'Change plan staged', 'Review the SQL script and preflight checks in Change Center.');
@@ -249,10 +358,10 @@ export function TableDesignerPage({
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
         <div>
           <h1 className="font-display text-2xl font-bold tracking-tight text-[#1B2340] dark:text-white">
-            {mode === 'simple' ? 'Visual Table Builder' : 'DDL Table & Column Designer'}
+            {mode === 'simple' ? 'Visual Table & Index Builder' : 'DDL Table, Constraint & Index Designer'}
           </h1>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-            Design tables with understandable types, preview exact T-SQL, and stage validated change plans.
+            Design tables, alter columns, manage primary/unique constraints and indexes, and preview exact T-SQL before staging.
           </p>
         </div>
 
@@ -277,13 +386,12 @@ export function TableDesignerPage({
                 : 'text-slate-600 dark:text-slate-400'
             }`}
           >
-            Modify Existing Table
+            Modify Columns, Keys & Indexes
           </button>
         </div>
       </div>
 
       <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
-        {/* Left Builder Panel */}
         <section className="xl:col-span-7 rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] p-5 space-y-5">
           {designAction === 'create' ? (
             <>
@@ -335,7 +443,6 @@ export function TableDesignerPage({
                 </div>
               </div>
 
-              {/* Fields Grid */}
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-semibold text-[#1B2340] dark:text-white">
@@ -451,7 +558,10 @@ export function TableDesignerPage({
                   <select
                     id="alter-tbl"
                     value={alterTargetTable?.fullName ?? ''}
-                    onChange={(e) => setAlterTableKey(e.target.value)}
+                    onChange={(e) => {
+                      setAlterTableKey(e.target.value);
+                      setSelectedConstraintCols([]);
+                    }}
                     className="w-full rounded-lg border border-[#E2E6F0] dark:border-[#232B45] bg-[#F7F8FC] dark:bg-[#181F38] px-3 py-2 text-xs font-mono text-[#1B2340] dark:text-white"
                   >
                     {(snapshot?.tables ?? []).map((t) => (
@@ -464,21 +574,27 @@ export function TableDesignerPage({
 
                 <div>
                   <label htmlFor="alter-op" className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">
-                    Modification Action
+                    DDL Operation
                   </label>
                   <select
                     id="alter-op"
                     value={alterKind}
-                    onChange={(e) => setAlterKind(e.target.value as 'ADD_COLUMN' | 'DROP_COLUMN')}
+                    onChange={(e) => setAlterKind(e.target.value as AlterOperationKind)}
                     className="w-full rounded-lg border border-[#E2E6F0] dark:border-[#232B45] bg-[#F7F8FC] dark:bg-[#181F38] px-3 py-2 text-xs text-[#1B2340] dark:text-white"
                   >
-                    <option value="ADD_COLUMN">Add New Field (Safe)</option>
-                    <option value="DROP_COLUMN">Remove Field (Destructive)</option>
+                    <option value="ADD_COLUMN">Add Column</option>
+                    <option value="ALTER_COLUMN">Modify Column Properties (SQL Server)</option>
+                    <option value="DROP_COLUMN">Remove Column (Destructive)</option>
+                    <option value="ADD_PRIMARY_KEY">Add Primary Key Constraint (SQL Server)</option>
+                    <option value="ADD_UNIQUE_CONSTRAINT">Add Unique Constraint</option>
+                    <option value="DROP_CONSTRAINT">Drop Constraint (SQL Server)</option>
+                    <option value="CREATE_INDEX">Create Index (Clustered/Nonclustered)</option>
+                    <option value="DROP_INDEX">Drop Index</option>
                   </select>
                 </div>
               </div>
 
-              {alterKind === 'ADD_COLUMN' ? (
+              {alterKind === 'ADD_COLUMN' && (
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 p-4 rounded-lg bg-[#F7F8FC] dark:bg-[#181F38] border border-[#E2E6F0] dark:border-[#232B45]">
                   <div>
                     <label htmlFor="add-col-name" className="block text-xs font-medium mb-1">
@@ -536,7 +652,65 @@ export function TableDesignerPage({
                     </label>
                   </div>
                 </div>
-              ) : (
+              )}
+
+              {alterKind === 'ALTER_COLUMN' && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 p-4 rounded-lg bg-[#F7F8FC] dark:bg-[#181F38] border border-[#E2E6F0] dark:border-[#232B45]">
+                  <div>
+                    <label className="block text-xs font-medium mb-1">Existing Column</label>
+                    <select
+                      value={alterColName}
+                      onChange={(e) => setAlterColName(e.target.value)}
+                      className="w-full rounded-md border border-[#E2E6F0] dark:border-[#232B45] bg-white dark:bg-[#12172B] px-3 py-1.5 text-xs font-mono"
+                    >
+                      {(alterTargetTable?.columns ?? []).map((c) => (
+                        <option key={c.name} value={c.name}>
+                          {c.name} ({c.sqlType})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium mb-1">New Target Type</label>
+                    <select
+                      value={alterColType}
+                      onChange={(e) => setAlterColType(e.target.value as FriendlyFieldType)}
+                      className="w-full rounded-md border border-[#E2E6F0] dark:border-[#232B45] bg-white dark:bg-[#12172B] px-3 py-1.5 text-xs"
+                    >
+                      {FRIENDLY_FIELD_TYPES.filter((t) => t.friendlyType !== 'auto_id').map((t) => (
+                        <option key={t.friendlyType} value={t.friendlyType}>
+                          {t.label} ({t.tsqlType})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  {alterColType === 'text' && (
+                    <div>
+                      <label className="block text-xs font-medium mb-1">Max Length</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={4000}
+                        value={alterColLength}
+                        onChange={(e) => setAlterColLength(Number(e.target.value))}
+                        className="w-full rounded-md border border-[#E2E6F0] dark:border-[#232B45] bg-white dark:bg-[#12172B] px-3 py-1.5 text-xs font-mono"
+                      />
+                    </div>
+                  )}
+                  <div className="flex items-end pb-1">
+                    <label className="inline-flex items-center gap-2 text-xs">
+                      <input
+                        type="checkbox"
+                        checked={!alterColNullable}
+                        onChange={(e) => setAlterColNullable(!e.target.checked)}
+                      />
+                      <span>Required (NOT NULL)</span>
+                    </label>
+                  </div>
+                </div>
+              )}
+
+              {alterKind === 'DROP_COLUMN' && (
                 <div className="p-4 rounded-lg bg-red-50/70 dark:bg-red-950/20 border border-red-200 dark:border-red-900 space-y-2">
                   <label htmlFor="drop-col-select" className="block text-xs font-medium text-[#E5484D]">
                     Select Column to Permanently Remove
@@ -556,17 +730,92 @@ export function TableDesignerPage({
                   </select>
                 </div>
               )}
+
+              {(alterKind === 'ADD_PRIMARY_KEY' ||
+                alterKind === 'ADD_UNIQUE_CONSTRAINT' ||
+                alterKind === 'CREATE_INDEX') && (
+                <div className="space-y-3 p-4 rounded-lg bg-[#F7F8FC] dark:bg-[#181F38] border border-[#E2E6F0] dark:border-[#232B45]">
+                  <div>
+                    <label className="block text-xs font-medium mb-1">
+                      {alterKind === 'CREATE_INDEX' ? 'Index Name (Optional)' : 'Constraint Name (Optional)'}
+                    </label>
+                    <input
+                      type="text"
+                      value={constraintName}
+                      onChange={(e) => setConstraintName(e.target.value)}
+                      placeholder={alterKind === 'CREATE_INDEX' ? 'IX_Table_Column' : 'UQ_Table_Column'}
+                      className="w-full rounded-md border border-[#E2E6F0] dark:border-[#232B45] bg-white dark:bg-[#12172B] px-3 py-1.5 text-xs font-mono"
+                    />
+                  </div>
+                  <div>
+                    <div className="text-xs font-medium mb-1.5">Included Columns</div>
+                    <div className="flex flex-wrap gap-2">
+                      {(alterTargetTable?.columns ?? []).map((c) => {
+                        const checked = selectedConstraintCols.includes(c.name);
+                        return (
+                          <label
+                            key={c.name}
+                            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-xs cursor-pointer ${
+                              checked
+                                ? 'border-[#6D4AFF] bg-[#6D4AFF]/10 text-[#6D4AFF]'
+                                : 'border-[#E2E6F0] dark:border-[#232B45] bg-white dark:bg-[#12172B]'
+                            }`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={(e) => {
+                                if (e.target.checked) setSelectedConstraintCols((p) => [...p, c.name]);
+                                else setSelectedConstraintCols((p) => p.filter((x) => x !== c.name));
+                              }}
+                            />
+                            <span className="font-mono">{c.name}</span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  {alterKind === 'CREATE_INDEX' && (
+                    <label className="inline-flex items-center gap-2 text-xs">
+                      <input
+                        type="checkbox"
+                        checked={uniqueIndexFlag}
+                        onChange={(e) => setUniqueIndexFlag(e.target.checked)}
+                      />
+                      <span>Create UNIQUE Index</span>
+                    </label>
+                  )}
+                </div>
+              )}
+
+              {(alterKind === 'DROP_CONSTRAINT' || alterKind === 'DROP_INDEX') && (
+                <div className="p-4 rounded-lg bg-[#F7F8FC] dark:bg-[#181F38] border border-[#E2E6F0] dark:border-[#232B45] space-y-2">
+                  <label className="block text-xs font-medium">
+                    {alterKind === 'DROP_INDEX' ? 'Index Name to Drop' : 'Constraint Name to Drop'}
+                  </label>
+                  <input
+                    type="text"
+                    value={constraintName}
+                    onChange={(e) => setConstraintName(e.target.value)}
+                    placeholder={
+                      alterKind === 'DROP_INDEX'
+                        ? alterTargetTable?.indexes[0]?.name || 'IX_Name'
+                        : 'PK_... or UQ_...'
+                    }
+                    className="w-full rounded-md border border-[#E2E6F0] dark:border-[#232B45] bg-white dark:bg-[#12172B] px-3 py-1.5 text-xs font-mono"
+                  />
+                </div>
+              )}
             </div>
           )}
         </section>
 
-        {/* Right Live SQL & Preflight Preview */}
         <aside className="xl:col-span-5 rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] p-5 space-y-4">
           <div className="flex items-center justify-between">
             <h2 className="font-display text-sm font-semibold text-[#1B2340] dark:text-white">
               Impact & Generated T-SQL Preview
             </h2>
-            <span className="text-xs text-slate-500">Changes 1 table</span>
+            <span className="text-xs text-slate-500">Target: {connection.method === 'local_sandbox' ? 'SQLite Sandbox' : 'SQL Server T-SQL'}</span>
           </div>
 
           {!previewResult.ok ? (
@@ -579,7 +828,6 @@ export function TableDesignerPage({
                 {previewResult.compiled.plainExplanation}
               </div>
 
-              {/* Preflight Checks */}
               <div className="space-y-1.5">
                 {previewResult.compiled.preflight.checks.map((chk) => (
                   <div key={chk.name} className="flex items-start gap-2 text-xs">
@@ -601,7 +849,6 @@ export function TableDesignerPage({
                 ))}
               </div>
 
-              {/* Exact SQL Script */}
               <div className="rounded-lg bg-[#13172B] text-slate-100 p-3.5 overflow-x-auto">
                 <pre className="text-xs font-mono leading-relaxed whitespace-pre-wrap">
                   {previewResult.compiled.tsql}

@@ -22,6 +22,8 @@ const baseConnection: ConnectionProfile = {
   encrypt: true,
   trustServerCertificate: false,
   readOnly: false,
+  timeoutMs: 8000,
+  reconnectOnStartup: true,
   environment: 'production',
   status: 'connected',
   engineVersion: 'SQL Server 2022',

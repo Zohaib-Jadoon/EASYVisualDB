@@ -1,15 +1,26 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Database,
+  Edit3,
+  FolderKanban,
   Key,
   Link2,
+  Plus,
   RefreshCw,
   Search,
   Table2,
   Trash2,
 } from 'lucide-react';
+import { api } from '../lib/api';
 import { FRIENDLY_FIELD_TYPES } from '../shared/sqlCompiler';
-import { AppMode, ConnectionProfile, SchemaSnapshot, TableSchema } from '../shared/types';
+import {
+  AppMode,
+  ConnectionProfile,
+  DatabaseInfo,
+  SchemaSnapshot,
+  TableDependency,
+  TableSchema,
+} from '../shared/types';
 import { NavSection } from './AppShell';
 
 interface DatabaseExplorerPageProps {
@@ -19,8 +30,10 @@ interface DatabaseExplorerPageProps {
   selectedTableKey: string | null;
   onSelectTableKey: (key: string) => void;
   onRefreshSchema: () => Promise<void>;
+  onRefreshAll: () => Promise<void>;
   onNavigate: (nav: NavSection) => void;
   onStageDropTable: (table: TableSchema) => Promise<void>;
+  onToast: (tone: 'success' | 'error' | 'info', title: string, detail?: string) => void;
 }
 
 export function DatabaseExplorerPage({
@@ -30,11 +43,33 @@ export function DatabaseExplorerPage({
   selectedTableKey,
   onSelectTableKey,
   onRefreshSchema,
+  onRefreshAll,
   onNavigate,
   onStageDropTable,
+  onToast,
 }: DatabaseExplorerPageProps) {
   const [search, setSearch] = useState('');
   const [refreshing, setRefreshing] = useState(false);
+
+  // Server databases & creation
+  const [databasesModalOpen, setDatabasesModalOpen] = useState(false);
+  const [databases, setDatabases] = useState<DatabaseInfo[]>([]);
+  const [loadingDbs, setLoadingDbs] = useState(false);
+  const [newDbName, setNewDbName] = useState('');
+  const [newDbCollation, setNewDbCollation] = useState('');
+  const [creatingDb, setCreatingDb] = useState(false);
+
+  // Table dependencies
+  const [dependencies, setDependencies] = useState<TableDependency[]>([]);
+  const [loadingDeps, setLoadingDeps] = useState(false);
+
+  // Safe Rename Modal
+  const [renameModal, setRenameModal] = useState<{
+    table: TableSchema;
+    columnName?: string;
+    newName: string;
+  } | null>(null);
+  const [renaming, setRenaming] = useState(false);
 
   const filteredTables = useMemo(() => {
     const tables = snapshot?.tables ?? [];
@@ -52,6 +87,93 @@ export function DatabaseExplorerPage({
     snapshot?.tables.find((t) => t.fullName === selectedTableKey) ??
     filteredTables[0] ??
     null;
+
+  useEffect(() => {
+    if (!connection || !activeTable) {
+      setDependencies([]);
+      return;
+    }
+    setLoadingDeps(true);
+    api
+      .getTableDependencies(connection.id, activeTable.schemaName, activeTable.tableName)
+      .then((res) => setDependencies(res.dependencies || []))
+      .catch(() => setDependencies([]))
+      .finally(() => setLoadingDeps(false));
+  }, [connection?.id, activeTable?.fullName]);
+
+  const loadDatabasesList = async () => {
+    if (!connection) return;
+    setLoadingDbs(true);
+    try {
+      const res = await api.listDatabases(connection.id);
+      setDatabases(res.databases || []);
+    } catch (err) {
+      onToast('error', 'Could not list server databases', err instanceof Error ? err.message : 'Error');
+    } finally {
+      setLoadingDbs(false);
+    }
+  };
+
+  const handleOpenDatabases = async () => {
+    setDatabasesModalOpen(true);
+    await loadDatabasesList();
+  };
+
+  const handleCreateDatabase = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!connection || !newDbName.trim()) return;
+    setCreatingDb(true);
+    try {
+      const res = await api.createDatabase(
+        connection.id,
+        newDbName.trim(),
+        newDbCollation.trim() || undefined
+      );
+      setNewDbName('');
+      setNewDbCollation('');
+      onToast('success', 'Database operation complete', res.message);
+      await loadDatabasesList();
+    } catch (err) {
+      onToast('error', 'Create database failed', err instanceof Error ? err.message : 'Permission denied');
+    } finally {
+      setCreatingDb(false);
+    }
+  };
+
+  const handleRenameSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!connection || !renameModal || !renameModal.newName.trim()) return;
+    setRenaming(true);
+    try {
+      const res = await api.renameObject(connection.id, {
+        schemaName: renameModal.table.schemaName,
+        tableName: renameModal.table.tableName,
+        columnName: renameModal.columnName,
+        newName: renameModal.newName.trim(),
+      });
+      onToast('success', 'Object renamed', res.message);
+      setRenameModal(null);
+      await onRefreshAll();
+    } catch (err) {
+      onToast('error', 'Rename failed', err instanceof Error ? err.message : 'Error');
+    } finally {
+      setRenaming(false);
+    }
+  };
+
+  const handleStageDropIndex = async (tbl: TableSchema, indexName: string) => {
+    if (!connection) return;
+    try {
+      await api.createPlan(connection.id, `Drop index ${indexName} on ${tbl.fullName}`, [
+        { kind: 'DROP_INDEX', indexName, schemaName: tbl.schemaName, tableName: tbl.tableName },
+      ]);
+      await onRefreshAll();
+      onToast('info', 'Drop index staged', 'Review and execute in Change Center.');
+      onNavigate('changes');
+    } catch (err) {
+      onToast('error', 'Unable to stage index drop', err instanceof Error ? err.message : 'Error');
+    }
+  };
 
   if (!connection || !snapshot) {
     return (
@@ -88,7 +210,15 @@ export function DatabaseExplorerPage({
             {snapshot.databaseName} · Snapshot {new Date(snapshot.capturedAt).toLocaleString()}
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={handleOpenDatabases}
+            className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-[#E2E6F0] dark:border-[#232B45] bg-white dark:bg-[#12172B] text-xs font-medium text-[#1B2340] dark:text-white hover:bg-slate-50 dark:hover:bg-[#181F38]"
+          >
+            <FolderKanban className="h-3.5 w-3.5 text-[#6D4AFF]" />
+            <span>Databases & Properties</span>
+          </button>
           <button
             type="button"
             disabled={refreshing}
@@ -116,7 +246,6 @@ export function DatabaseExplorerPage({
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
-        {/* Left Tree */}
         <aside className="lg:col-span-4 rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] flex flex-col max-h-[700px]">
           <div className="p-3 border-b border-[#E2E6F0] dark:border-[#232B45]">
             <div className="relative">
@@ -160,7 +289,6 @@ export function DatabaseExplorerPage({
           </div>
         </aside>
 
-        {/* Right Inspector */}
         <section className="lg:col-span-8 rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] p-5 space-y-5">
           {!activeTable ? (
             <div className="py-12 text-center text-xs text-slate-500">Select a table to inspect its structure.</div>
@@ -178,7 +306,20 @@ export function DatabaseExplorerPage({
                       : 'No Primary Key (read-only editing)'}
                   </p>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setRenameModal({
+                        table: activeTable,
+                        newName: activeTable.tableName,
+                      })
+                    }
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-[#E2E6F0] dark:border-[#232B45] text-xs font-medium hover:bg-slate-50 dark:hover:bg-[#181F38]"
+                  >
+                    <Edit3 className="h-3.5 w-3.5" />
+                    <span>Rename Table</span>
+                  </button>
                   <button
                     type="button"
                     onClick={() => {
@@ -215,6 +356,7 @@ export function DatabaseExplorerPage({
                         </th>
                         <th className="py-2 px-3 font-medium">Required</th>
                         <th className="py-2 px-3 font-medium">Constraints</th>
+                        <th className="py-2 px-3 font-medium text-right">Action</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-[#E2E6F0] dark:divide-[#232B45]">
@@ -245,6 +387,21 @@ export function DatabaseExplorerPage({
                               .filter(Boolean)
                               .join(' · ') || '—'}
                           </td>
+                          <td className="py-2 px-3 text-right">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setRenameModal({
+                                  table: activeTable,
+                                  columnName: col.name,
+                                  newName: col.name,
+                                })
+                              }
+                              className="text-[11px] text-[#6D4AFF] hover:underline"
+                            >
+                              Rename
+                            </button>
+                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -274,26 +431,232 @@ export function DatabaseExplorerPage({
                 </div>
 
                 <div className="rounded-lg border border-[#E2E6F0] dark:border-[#232B45] p-3.5 space-y-2">
-                  <div className="text-xs font-semibold text-[#1B2340] dark:text-white">
-                    Indexes ({activeTable.indexes.length})
+                  <div className="text-xs font-semibold text-[#1B2340] dark:text-white flex items-center justify-between">
+                    <span>Indexes ({activeTable.indexes.length})</span>
+                    <button
+                      type="button"
+                      onClick={() => onNavigate('table-builder')}
+                      className="text-[11px] font-medium text-[#6D4AFF] hover:underline"
+                    >
+                      + Create Index
+                    </button>
                   </div>
                   {activeTable.indexes.length === 0 ? (
                     <p className="text-xs text-slate-500">No nonclustered indexes defined.</p>
                   ) : (
                     <ul className="space-y-1.5 text-xs">
                       {activeTable.indexes.map((idx) => (
-                        <li key={idx.name} className="font-mono text-slate-600 dark:text-slate-300">
-                          {idx.name} ({idx.columns.join(', ')}) {idx.isUnique ? '· UNIQUE' : ''}
+                        <li key={idx.name} className="flex items-center justify-between gap-2 font-mono text-slate-600 dark:text-slate-300">
+                          <span className="truncate">
+                            {idx.name} ({idx.columns.join(', ')}) {idx.isUnique ? '· UNIQUE' : ''}
+                          </span>
+                          {!idx.isPrimaryKey && (
+                            <button
+                              type="button"
+                              onClick={() => handleStageDropIndex(activeTable, idx.name)}
+                              className="text-[11px] text-[#E5484D] hover:underline shrink-0"
+                            >
+                              Drop
+                            </button>
+                          )}
                         </li>
                       ))}
                     </ul>
                   )}
                 </div>
               </div>
+
+              {/* Live Dependencies Inspector */}
+              <div className="rounded-lg border border-[#E2E6F0] dark:border-[#232B45] p-3.5 space-y-2">
+                <div className="text-xs font-semibold text-[#1B2340] dark:text-white">
+                  Object Dependencies ({dependencies.length})
+                </div>
+                {loadingDeps ? (
+                  <p className="text-xs text-slate-400">Checking foreign key and view references...</p>
+                ) : dependencies.length === 0 ? (
+                  <p className="text-xs text-slate-500">No incoming or outgoing table/view dependencies detected.</p>
+                ) : (
+                  <ul className="space-y-1 text-xs">
+                    {dependencies.map((d, i) => (
+                      <li key={i} className="flex flex-wrap items-center gap-2 text-slate-600 dark:text-slate-300">
+                        <span className="font-mono text-[11px] font-semibold text-[#6D4AFF] uppercase">
+                          {d.direction}
+                        </span>
+                        <span className="font-mono">{d.objectName}</span>
+                        <span className="text-slate-400">— {d.detail}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
             </>
           )}
         </section>
       </div>
+
+      {/* Databases & Properties Modal */}
+      {databasesModalOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Server Databases and Properties"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/55"
+        >
+          <div className="w-full max-w-4xl rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] p-5 space-y-4 max-h-[88vh] overflow-y-auto">
+            <div className="flex items-center justify-between pb-3 border-b border-[#E2E6F0] dark:border-[#232B45]">
+              <div>
+                <h2 className="font-display text-base font-bold text-[#1B2340] dark:text-white">
+                  Server Databases & Properties — {connection.name}
+                </h2>
+                <p className="text-xs text-slate-500">
+                  Inspect recovery models, collation, disk size, and execute guarded CREATE DATABASE operations.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDatabasesModalOpen(false)}
+                className="px-3 py-1 rounded-lg border border-[#E2E6F0] dark:border-[#232B45] text-xs"
+              >
+                Close
+              </button>
+            </div>
+
+            {connection.method !== 'local_sandbox' && (
+              <form
+                onSubmit={handleCreateDatabase}
+                className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 p-3.5 rounded-lg bg-[#F7F8FC] dark:bg-[#181F38] border border-[#E2E6F0] dark:border-[#232B45]"
+              >
+                <input
+                  type="text"
+                  required
+                  placeholder="New SQL Server database name"
+                  value={newDbName}
+                  onChange={(e) => setNewDbName(e.target.value)}
+                  className="rounded-lg border border-[#E2E6F0] dark:border-[#232B45] bg-white dark:bg-[#12172B] px-3 py-1.5 text-xs font-mono"
+                />
+                <input
+                  type="text"
+                  placeholder="Collation (optional, e.g. SQL_Latin1_General_CP1_CI_AS)"
+                  value={newDbCollation}
+                  onChange={(e) => setNewDbCollation(e.target.value)}
+                  className="rounded-lg border border-[#E2E6F0] dark:border-[#232B45] bg-white dark:bg-[#12172B] px-3 py-1.5 text-xs font-mono"
+                />
+                <button
+                  type="submit"
+                  disabled={creatingDb}
+                  className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#6D4AFF] text-white text-xs font-medium disabled:opacity-50"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  <span>{creatingDb ? 'Creating...' : 'Create Database'}</span>
+                </button>
+              </form>
+            )}
+
+            <div className="overflow-x-auto border border-[#E2E6F0] dark:border-[#232B45] rounded-lg">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-[#F7F8FC] dark:bg-[#181F38] border-b border-[#E2E6F0] dark:border-[#232B45] text-slate-500">
+                  <tr>
+                    <th className="px-3 py-2 font-medium">Database</th>
+                    <th className="px-3 py-2 font-medium">State</th>
+                    <th className="px-3 py-2 font-medium">Recovery</th>
+                    <th className="px-3 py-2 font-medium">Collation</th>
+                    <th className="px-3 py-2 font-medium text-right">Size (MB)</th>
+                    <th className="px-3 py-2 font-medium">Access</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#E2E6F0] dark:divide-[#232B45]">
+                  {loadingDbs ? (
+                    <tr>
+                      <td colSpan={6} className="px-4 py-8 text-center text-slate-500">
+                        Inspecting server database catalog...
+                      </td>
+                    </tr>
+                  ) : databases.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="px-4 py-8 text-center text-slate-500">
+                        No database metadata returned.
+                      </td>
+                    </tr>
+                  ) : (
+                    databases.map((db) => (
+                      <tr key={db.name} className="hover:bg-[#F7F8FC] dark:hover:bg-[#181F38]/50">
+                        <td className="px-3 py-2 font-mono font-medium text-[#1B2340] dark:text-white">
+                          {db.name}
+                          {db.isSystem ? ' (system)' : ''}
+                        </td>
+                        <td className="px-3 py-2">{db.stateDesc}</td>
+                        <td className="px-3 py-2">{db.recoveryModel}</td>
+                        <td className="px-3 py-2 font-mono text-[11px]">{db.collationName}</td>
+                        <td className="px-3 py-2 text-right font-mono tabular-nums">{db.sizeMb.toFixed(2)}</td>
+                        <td className="px-3 py-2">
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              await api.updateConnection(connection.id, { database: db.name });
+                              setDatabasesModalOpen(false);
+                              await onRefreshAll();
+                              onToast('info', `Switched database context to ${db.name}`);
+                            }}
+                            disabled={db.name === connection.database || connection.method === 'local_sandbox'}
+                            className="text-[#6D4AFF] hover:underline disabled:opacity-40"
+                          >
+                            {db.name === connection.database ? 'Active' : 'Switch'}
+                          </button>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Safe Object Rename Modal */}
+      {renameModal && (
+        <div role="dialog" aria-modal="true" className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/55">
+          <form
+            onSubmit={handleRenameSubmit}
+            className="w-full max-w-md rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] p-5 space-y-4"
+          >
+            <h2 className="font-display text-base font-bold text-[#1B2340] dark:text-white">
+              Rename {renameModal.columnName ? 'Column' : 'Table'}
+            </h2>
+            <p className="text-xs text-slate-500">
+              Current identifier:{' '}
+              <span className="font-mono">
+                {renameModal.table.fullName}
+                {renameModal.columnName ? `.${renameModal.columnName}` : ''}
+              </span>
+            </p>
+            <input
+              type="text"
+              required
+              autoFocus
+              value={renameModal.newName}
+              onChange={(e) => setRenameModal({ ...renameModal, newName: e.target.value })}
+              className="w-full rounded-lg border border-[#E2E6F0] dark:border-[#232B45] bg-[#F7F8FC] dark:bg-[#181F38] px-3 py-2 text-xs font-mono"
+            />
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setRenameModal(null)}
+                className="px-3 py-1.5 rounded-lg border border-[#E2E6F0] dark:border-[#232B45] text-xs"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={renaming}
+                className="px-4 py-1.5 rounded-lg bg-[#6D4AFF] text-white text-xs font-medium disabled:opacity-50"
+              >
+                {renaming ? 'Renaming...' : 'Execute Rename'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 }

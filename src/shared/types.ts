@@ -51,6 +51,43 @@ export interface FieldTypeMapping {
   defaultScale?: number;
 }
 
+export interface AuthUser {
+  id: string;
+  name: string;
+  email: string;
+  createdAt: string;
+}
+
+export interface AuthSessionInfo {
+  authenticated: boolean;
+  user: AuthUser | null;
+  demoMode: boolean;
+}
+
+export interface WorkspaceInvitation {
+  id: string;
+  workspaceId: string;
+  email: string;
+  name: string;
+  role: WorkspaceRole;
+  tokenPreview: string;
+  status: 'pending' | 'accepted' | 'revoked';
+  invitedByName: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface BillingCheckoutSession {
+  id: string;
+  workspaceId: string;
+  targetTier: PlanTier;
+  provider: 'stripe_compatible' | 'manual_invoice';
+  status: 'pending' | 'completed';
+  checkoutUrl: string | null;
+  note: string;
+  createdAt: string;
+}
+
 export interface WorkspaceMember {
   id: string;
   name: string;
@@ -111,19 +148,48 @@ export interface ConnectionDiagnosticStep {
   durationMs: number;
 }
 
+export interface DiscoveredSqlInstance {
+  id: string;
+  serverName: string;
+  instanceName: string;
+  fullTarget: string;
+  port: number | null;
+  version: string;
+  serviceName?: string;
+  serviceStatus: 'Running' | 'Stopped' | 'Unknown';
+  availability: 'available' | 'stopped' | 'unreachable' | 'unknown';
+  isDefaultInstance: boolean;
+  isClustered?: boolean;
+  source: 'windows_service' | 'windows_registry' | 'sql_browser_udp' | 'agent_probe';
+}
+
+export interface LocalDiscoveryResponse {
+  supported: boolean;
+  hostPlatform: string;
+  viaAgentId: string | null;
+  viaAgentName: string | null;
+  instances: DiscoveredSqlInstance[];
+  message: string;
+  checkedAt: string;
+}
+
 export interface ConnectionProfile {
   id: string;
   workspaceId: string;
   name: string;
   method: ConnectionMethod;
   host: string;
+  instanceName?: string | null;
   port: number;
   database: string;
   authMethod: AuthMethod;
   username: string;
+  domain?: string | null;
   encrypt: boolean;
   trustServerCertificate: boolean;
   readOnly: boolean;
+  timeoutMs: number;
+  reconnectOnStartup: boolean;
   environment: EnvironmentKind;
   status: 'connected' | 'degraded' | 'disconnected' | 'error';
   engineVersion: string;
@@ -131,6 +197,27 @@ export interface ConnectionProfile {
   lastError?: string | null;
   capabilities: ConnectionCapabilities;
   agentId?: string | null;
+}
+
+export interface DatabaseInfo {
+  name: string;
+  stateDesc: string;
+  recoveryModel: string;
+  compatibilityLevel: number;
+  collationName: string;
+  sizeMb: number;
+  createDate: string;
+  isReadOnly: boolean;
+  isSystem: boolean;
+  ownerName?: string;
+}
+
+export interface TableDependency {
+  direction: 'referencing' | 'referenced' | 'view';
+  objectName: string;
+  objectType: 'TABLE' | 'VIEW' | 'FOREIGN_KEY';
+  constraintName?: string;
+  detail: string;
 }
 
 export interface ColumnSchema {
@@ -223,6 +310,17 @@ export type SchemaOperation =
       field: FieldDraft;
     }
   | {
+      kind: 'ALTER_COLUMN';
+      schemaName: string;
+      tableName: string;
+      columnName: string;
+      friendlyType: FriendlyFieldType;
+      length?: number;
+      precision?: number;
+      scale?: number;
+      nullable: boolean;
+    }
+  | {
       kind: 'DROP_COLUMN';
       schemaName: string;
       tableName: string;
@@ -246,12 +344,56 @@ export type SchemaOperation =
       onUpdate: 'NO ACTION' | 'CASCADE';
     }
   | {
+      kind: 'DROP_FOREIGN_KEY';
+      constraintName: string;
+      schemaName: string;
+      tableName: string;
+    }
+  | {
+      kind: 'ADD_UNIQUE_CONSTRAINT';
+      constraintName: string;
+      schemaName: string;
+      tableName: string;
+      columns: string[];
+    }
+  | {
+      kind: 'ADD_PRIMARY_KEY';
+      constraintName: string;
+      schemaName: string;
+      tableName: string;
+      columns: string[];
+    }
+  | {
+      kind: 'DROP_CONSTRAINT';
+      constraintName: string;
+      schemaName: string;
+      tableName: string;
+    }
+  | {
       kind: 'CREATE_INDEX';
       indexName: string;
       schemaName: string;
       tableName: string;
       columns: string[];
       isUnique: boolean;
+    }
+  | {
+      kind: 'DROP_INDEX';
+      indexName: string;
+      schemaName: string;
+      tableName: string;
+    }
+  | {
+      kind: 'RENAME_OBJECT';
+      schemaName: string;
+      tableName: string;
+      columnName?: string;
+      newName: string;
+    }
+  | {
+      kind: 'CREATE_DATABASE';
+      databaseName: string;
+      collation?: string;
     };
 
 export type RiskLevel = 'low' | 'medium' | 'high' | 'destructive';
@@ -305,6 +447,22 @@ export interface ChangePlan {
   errorMessage?: string | null;
 }
 
+export interface SchemaDriftReport {
+  drifted: boolean;
+  targetFingerprint: string;
+  liveFingerprint: string;
+  checkedAt: string;
+  addedTables: string[];
+  removedTables: string[];
+  changedTables: Array<{
+    fullName: string;
+    addedColumns: string[];
+    removedColumns: string[];
+    alteredColumns: string[];
+  }>;
+  summary: string;
+}
+
 export interface AuditEvent {
   id: string;
   workspaceId: string;
@@ -315,17 +473,26 @@ export interface AuditEvent {
   action: string;
   resourceType:
     | 'connection'
+    | 'database'
     | 'schema_plan'
     | 'record'
     | 'query'
     | 'agent'
     | 'policy'
-    | 'billing';
+    | 'billing'
+    | 'auth';
   target: string;
   databaseName?: string | null;
   status: 'succeeded' | 'denied' | 'failed';
   detail: string;
   timestamp: string;
+}
+
+export interface RecordColumnFilter {
+  id: string;
+  column: string;
+  operator: 'eq' | 'neq' | 'contains' | 'gt' | 'lt' | 'is_null' | 'is_not_null';
+  value: string;
 }
 
 export interface VisualQueryFilter {
@@ -335,11 +502,29 @@ export interface VisualQueryFilter {
   value: string;
 }
 
+export interface VisualQueryJoin {
+  id: string;
+  joinType: 'INNER' | 'LEFT';
+  targetSchema: string;
+  targetTable: string;
+  sourceColumn: string;
+  targetColumn: string;
+}
+
+export interface VisualQueryAggregate {
+  func: 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX';
+  column: string;
+  alias: string;
+}
+
 export interface VisualQuerySpec {
   schemaName: string;
   tableName: string;
   columns: string[];
+  joins?: VisualQueryJoin[];
   filters: VisualQueryFilter[];
+  groupBy?: string[];
+  aggregates?: VisualQueryAggregate[];
   orderBy?: {
     column: string;
     direction: 'ASC' | 'DESC';
@@ -355,6 +540,13 @@ export interface QueryExecutionResult {
   sqlExecuted: string;
   truncated: boolean;
   statementType: 'SELECT' | 'EXPLAIN' | 'MUTATION';
+}
+
+export interface SqlErrorExplanation {
+  code: number | null;
+  title: string;
+  summary: string;
+  suggestion: string;
 }
 
 export interface DiagramNodePosition {
@@ -374,6 +566,38 @@ export interface WindowsAgentRecord {
   lastHeartbeatAt: string | null;
   pairingTokenPreview: string;
   createdAt: string;
+  osInfo?: string | null;
+  discoveredInstancesCount?: number;
+}
+
+export interface AgentRpcRequest {
+  type: 'rpc_request';
+  requestId: string;
+  method:
+    | 'discover_instances'
+    | 'test_connection'
+    | 'list_databases'
+    | 'get_database_properties'
+    | 'create_database'
+    | 'rename_object'
+    | 'introspect'
+    | 'get_dependencies'
+    | 'browse_rows'
+    | 'insert_row'
+    | 'update_row'
+    | 'delete_rows'
+    | 'bulk_update'
+    | 'execute_query'
+    | 'apply_operations';
+  payload: Record<string, unknown>;
+}
+
+export interface AgentRpcResponse {
+  type: 'rpc_response';
+  requestId: string;
+  ok: boolean;
+  result?: unknown;
+  error?: string;
 }
 
 export interface AiSchemaProposal {
@@ -392,4 +616,15 @@ export interface AiSchemaProposal {
     targetColumn: string;
     reason: string;
   }>;
+}
+
+export interface AiRelationshipSuggestion {
+  sourceSchema: string;
+  sourceTable: string;
+  sourceColumn: string;
+  targetSchema: string;
+  targetTable: string;
+  targetColumn: string;
+  reason: string;
+  confidence: 'high' | 'medium';
 }

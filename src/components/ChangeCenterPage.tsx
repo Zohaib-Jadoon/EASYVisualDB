@@ -3,8 +3,11 @@ import {
   AlertTriangle,
   CheckCircle2,
   FileCode2,
+  GitCompare,
   Play,
+  RefreshCw,
   ShieldCheck,
+  Trash2,
   XCircle,
 } from 'lucide-react';
 import { api } from '../lib/api';
@@ -12,6 +15,7 @@ import { canApproveChangePlan, canModifySchema } from '../shared/permissions';
 import {
   ChangePlan,
   ConnectionProfile,
+  SchemaDriftReport,
   WorkspaceSummary,
 } from '../shared/types';
 import { NavSection } from './AppShell';
@@ -36,11 +40,61 @@ export function ChangeCenterPage({
   const [selectedPlanId, setSelectedPlanId] = useState<string>(plans[0]?.id ?? '');
   const [confirmInputs, setConfirmInputs] = useState<Record<string, string>>({});
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [driftReports, setDriftReports] = useState<Record<string, SchemaDriftReport>>({});
+  const [checkingDrift, setCheckingDrift] = useState(false);
 
   const selectedPlan = plans.find((p) => p.id === selectedPlanId) ?? plans[0] ?? null;
   const targetConnection = selectedPlan
     ? connections.find((c) => c.id === selectedPlan.connectionId) ?? null
     : null;
+
+  const handleCheckDrift = async (plan: ChangePlan) => {
+    setCheckingDrift(true);
+    try {
+      const res = await api.checkPlanDrift(plan.id);
+      setDriftReports((prev) => ({ ...prev, [plan.id]: res.report }));
+      if (res.report.drifted) {
+        onToast('error', 'Schema drift detected', res.report.summary);
+      } else {
+        onToast('success', 'No schema drift', res.report.summary);
+      }
+    } catch (err) {
+      onToast('error', 'Drift check failed', err instanceof Error ? err.message : 'Error');
+    } finally {
+      setCheckingDrift(false);
+    }
+  };
+
+  const handleRevalidate = async (plan: ChangePlan) => {
+    setBusyId(plan.id);
+    try {
+      await api.revalidatePlan(plan.id);
+      setDriftReports((prev) => {
+        const next = { ...prev };
+        delete next[plan.id];
+        return next;
+      });
+      await onRefreshAfterChange();
+      onToast('success', 'Plan revalidated against live schema', 'Fingerprint and preflight checks updated.');
+    } catch (err) {
+      onToast('error', 'Revalidation failed', err instanceof Error ? err.message : 'Error');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleDiscard = async (plan: ChangePlan) => {
+    setBusyId(plan.id);
+    try {
+      await api.deletePlan(plan.id);
+      await onRefreshAfterChange();
+      onToast('info', 'Draft discarded', `${plan.title} was deleted.`);
+    } catch (err) {
+      onToast('error', 'Could not discard plan', err instanceof Error ? err.message : 'Error');
+    } finally {
+      setBusyId(null);
+    }
+  };
 
   const handleApprove = async (plan: ChangePlan) => {
     setBusyId(plan.id);
@@ -73,6 +127,8 @@ export function ChangeCenterPage({
     }
   };
 
+  const activeDrift = selectedPlan ? driftReports[selectedPlan.id] : undefined;
+
   return (
     <div className="max-w-7xl mx-auto space-y-5">
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
@@ -81,7 +137,7 @@ export function ChangeCenterPage({
             Change Center
           </h1>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-            Draft → Validate → Preview → Approve → Execute → Audit. No schema change runs without review.
+            Draft → Validate → Drift Check → Approve → Execute → Audit. No schema change runs without review.
           </p>
         </div>
         <button
@@ -93,7 +149,6 @@ export function ChangeCenterPage({
         </button>
       </div>
 
-      {/* Recovery Boundary Disclaimer */}
       <div className="rounded-xl border border-amber-200 dark:border-amber-800 bg-amber-50/70 dark:bg-amber-950/20 px-4 py-3 text-xs text-amber-900 dark:text-amber-200">
         <strong>Recovery Boundary:</strong> Application audit logs and schema snapshots are not SQL Server backups. Ensure your SQL Server backup/restore policy is current before executing destructive DDL.
       </div>
@@ -110,7 +165,6 @@ export function ChangeCenterPage({
         </div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
-          {/* Plan List */}
           <aside className="lg:col-span-4 rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] divide-y divide-[#E2E6F0] dark:divide-[#232B45] max-h-[680px] overflow-y-auto">
             {plans.map((p) => {
               const active = selectedPlan?.id === p.id;
@@ -149,7 +203,6 @@ export function ChangeCenterPage({
             })}
           </aside>
 
-          {/* Plan Detail */}
           {selectedPlan && (
             <section className="lg:col-span-8 rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] p-5 space-y-4">
               <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 pb-4 border-b border-[#E2E6F0] dark:border-[#232B45]">
@@ -163,16 +216,79 @@ export function ChangeCenterPage({
                     <span className="font-mono">{selectedPlan.targetFingerprint}</span>
                   </p>
                 </div>
-                <span className="text-xs font-medium capitalize text-[#6D4AFF]">
-                  Status: {selectedPlan.status.replace('_', ' ')}
-                </span>
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  {selectedPlan.status !== 'succeeded' && (
+                    <>
+                      <button
+                        type="button"
+                        disabled={checkingDrift}
+                        onClick={() => handleCheckDrift(selectedPlan)}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border border-[#E2E6F0] dark:border-[#232B45] text-xs font-medium hover:bg-slate-50 dark:hover:bg-[#181F38]"
+                      >
+                        <GitCompare className="h-3.5 w-3.5 text-[#6D4AFF]" />
+                        <span>{checkingDrift ? 'Checking Drift...' : 'Check Drift'}</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busyId === selectedPlan.id}
+                        onClick={() => handleRevalidate(selectedPlan)}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border border-[#E2E6F0] dark:border-[#232B45] text-xs font-medium hover:bg-slate-50 dark:hover:bg-[#181F38]"
+                      >
+                        <RefreshCw className="h-3.5 w-3.5" />
+                        <span>Revalidate</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busyId === selectedPlan.id}
+                        onClick={() => handleDiscard(selectedPlan)}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border border-[#E2E6F0] dark:border-[#232B45] text-xs text-[#E5484D] hover:bg-red-50 dark:hover:bg-red-950/30"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                        <span>Discard</span>
+                      </button>
+                    </>
+                  )}
+                </div>
               </div>
 
               <div className="text-xs text-slate-700 dark:text-slate-300 leading-relaxed">
                 {selectedPlan.plainExplanation}
               </div>
 
-              {/* Preflight & Warnings */}
+              {/* Schema Drift Report */}
+              {activeDrift && (
+                <div
+                  className={`rounded-lg border p-3.5 text-xs space-y-1.5 ${
+                    activeDrift.drifted
+                      ? 'border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/30 text-amber-900 dark:text-amber-200'
+                      : 'border-emerald-300 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/30 text-emerald-900 dark:text-emerald-200'
+                  }`}
+                >
+                  <div className="font-semibold">
+                    {activeDrift.drifted ? 'Schema Drift Detected Against Target Database' : 'Schema Baseline Matches Live Database'}
+                  </div>
+                  <p>{activeDrift.summary}</p>
+                  {activeDrift.addedTables.length > 0 && (
+                    <div className="font-mono text-[11px]">Added tables: {activeDrift.addedTables.join(', ')}</div>
+                  )}
+                  {activeDrift.removedTables.length > 0 && (
+                    <div className="font-mono text-[11px]">Removed tables: {activeDrift.removedTables.join(', ')}</div>
+                  )}
+                  {activeDrift.changedTables.map((ct) => (
+                    <div key={ct.fullName} className="font-mono text-[11px]">
+                      Modified {ct.fullName}:{' '}
+                      {[
+                        ct.addedColumns.length ? `+cols(${ct.addedColumns.join(',')})` : '',
+                        ct.removedColumns.length ? `-cols(${ct.removedColumns.join(',')})` : '',
+                        ct.alteredColumns.length ? `~cols(${ct.alteredColumns.join(',')})` : '',
+                      ]
+                        .filter(Boolean)
+                        .join(' ')}
+                    </div>
+                  ))}
+                </div>
+              )}
+
               {selectedPlan.preflight.warnings.map((w, idx) => (
                 <div
                   key={idx}
@@ -183,7 +299,6 @@ export function ChangeCenterPage({
                 </div>
               ))}
 
-              {/* Exact T-SQL Script */}
               <div>
                 <div className="text-xs font-semibold text-slate-600 dark:text-slate-300 mb-1.5">
                   Reviewed T-SQL Execution Plan
@@ -195,7 +310,6 @@ export function ChangeCenterPage({
                 </div>
               </div>
 
-              {/* Execution Result or Error */}
               {selectedPlan.executionSummary && (
                 <div className="rounded-lg bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800 p-3 text-xs text-emerald-800 dark:text-emerald-300 flex items-center gap-2">
                   <CheckCircle2 className="h-4 w-4 shrink-0" />
@@ -210,7 +324,6 @@ export function ChangeCenterPage({
                 </div>
               )}
 
-              {/* Actions */}
               {selectedPlan.status !== 'succeeded' && workspace && (
                 <div className="pt-3 border-t border-[#E2E6F0] dark:border-[#232B45] space-y-3">
                   {selectedPlan.requiresConfirmText && (

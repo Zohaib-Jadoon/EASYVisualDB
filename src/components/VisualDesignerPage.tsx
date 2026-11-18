@@ -15,6 +15,7 @@ import {
   useNodesState,
 } from '@xyflow/react';
 import {
+  Code2,
   Download,
   Key,
   LayoutGrid,
@@ -22,13 +23,17 @@ import {
   Plus,
   Save,
   Search,
+  Trash2,
 } from 'lucide-react';
 import { api } from '../lib/api';
-import { areColumnTypesCompatibleForFk } from '../shared/sqlCompiler';
+import { saveExportWithDesktopFallback } from '../lib/desktopBridge';
+import { areColumnTypesCompatibleForFk, compileOperationsPlan } from '../shared/sqlCompiler';
 import {
   AppMode,
   ConnectionProfile,
   DiagramNodePosition,
+  ForeignKeySchema,
+  SchemaOperation,
   SchemaSnapshot,
   TableSchema,
 } from '../shared/types';
@@ -143,6 +148,10 @@ export function VisualDesignerPage({
   const [onDelete, setOnDelete] = useState<'NO ACTION' | 'CASCADE' | 'SET NULL'>('NO ACTION');
   const [onUpdate, setOnUpdate] = useState<'NO ACTION' | 'CASCADE'>('NO ACTION');
 
+  // Edge inspection / Drop FK modal
+  const [selectedFk, setSelectedFk] = useState<ForeignKeySchema | null>(null);
+  const [sqlPreviewOpen, setSqlPreviewOpen] = useState(false);
+
   useEffect(() => {
     if (!connection) return;
     api
@@ -170,7 +179,7 @@ export function VisualDesignerPage({
       return {
         id: tbl.fullName,
         type: 'tableNode',
-        position: saved ? { x: saved.x, y: saved.y } : { x: 40 + col * 410, y: 40 + row * 340 },
+        position: saved ? { x: saved.x, y: saved.y } : { x: 40 + col * 480, y: 40 + row * 370 },
         data: {
           table: tbl,
           mode,
@@ -180,6 +189,18 @@ export function VisualDesignerPage({
       };
     });
   }, [snapshot, savedPositions, mode, search, openRecordsForTable]);
+
+  const fkByEdgeId = useMemo(() => {
+    const map = new Map<string, ForeignKeySchema>();
+    for (const tbl of snapshot?.tables ?? []) {
+      for (const fk of tbl.foreignKeys) {
+        const targetKey = `${fk.targetSchema}.${fk.targetTable}`;
+        const edgeId = `${tbl.fullName}.${fk.sourceColumn}->${targetKey}.${fk.targetColumn}`;
+        map.set(edgeId, fk);
+      }
+    }
+    return map;
+  }, [snapshot]);
 
   const initialEdges: Edge[] = useMemo(() => {
     const tables = snapshot?.tables ?? [];
@@ -216,27 +237,24 @@ export function VisualDesignerPage({
     setEdges(initialEdges);
   }, [initialNodes, initialEdges, setNodes, setEdges]);
 
-  const handleConnect = useCallback(
-    (conn: Connection) => {
-      if (!conn.source || !conn.target || conn.source === conn.target) return;
-      const sCol = conn.sourceHandle?.replace('src:', '') ?? '';
-      const tCol = conn.targetHandle?.replace('tgt:', '') ?? '';
-      setSourceTableKey(conn.source);
-      setSourceColumn(sCol);
-      setTargetTableKey(conn.target);
-      setTargetColumn(tCol);
-      setFkModalOpen(true);
-    },
-    []
-  );
+  const handleConnect = useCallback((conn: Connection) => {
+    if (!conn.source || !conn.target || conn.source === conn.target) return;
+    const sCol = conn.sourceHandle?.replace('src:', '') ?? '';
+    const tCol = conn.targetHandle?.replace('tgt:', '') ?? '';
+    setSourceTableKey(conn.source);
+    setSourceColumn(sCol);
+    setTargetTableKey(conn.target);
+    setTargetColumn(tCol);
+    setFkModalOpen(true);
+  }, []);
 
   const handleAutoLayout = () => {
     setNodes((nds) =>
       nds.map((node, idx) => ({
         ...node,
         position: {
-          x: 40 + (idx % 3) * 410,
-          y: 40 + Math.floor(idx / 3) * 340,
+          x: 40 + (idx % 3) * 480,
+          y: 40 + Math.floor(idx / 3) * 370,
         },
       }))
     );
@@ -261,7 +279,7 @@ export function VisualDesignerPage({
     }
   };
 
-  const handleExportSvg = () => {
+  const handleExportSvg = async () => {
     if (!snapshot) return;
     const width = 1100;
     const height = Math.max(500, Math.ceil(nodes.length / 3) * 300 + 80);
@@ -284,13 +302,15 @@ export function VisualDesignerPage({
       })
       .join('');
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><rect width="100%" height="100%" fill="#F7F8FC"/>${rects}</svg>`;
-    const blob = new Blob([svg], { type: 'image/svg+xml' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${snapshot.databaseName}-diagram.svg`;
-    a.click();
-    URL.revokeObjectURL(url);
+    const saved = await saveExportWithDesktopFallback({
+      defaultName: `${snapshot.databaseName}-diagram.svg`,
+      content: svg,
+      mimeType: 'image/svg+xml',
+      filters: [{ name: 'SVG Vector Diagram (*.svg)', extensions: ['svg'] }],
+    });
+    if (saved.saved) {
+      onToast('success', 'ER Diagram exported', saved.filePath || `${snapshot.databaseName}-diagram.svg`);
+    }
   };
 
   const sourceTblObj = snapshot?.tables.find((t) => t.fullName === sourceTableKey);
@@ -302,25 +322,42 @@ export function VisualDesignerPage({
       ? areColumnTypesCompatibleForFk(srcColObj.friendlyType, tgtColObj.friendlyType)
       : true;
 
+  const pendingFkOperation: SchemaOperation[] = useMemo(() => {
+    if (!sourceTblObj || !targetTblObj || !sourceColumn || !targetColumn) return [];
+    return [
+      {
+        kind: 'ADD_FOREIGN_KEY',
+        constraintName: `FK_${sourceTblObj.tableName}_${sourceColumn}_${targetTblObj.tableName}`,
+        sourceSchema: sourceTblObj.schemaName,
+        sourceTable: sourceTblObj.tableName,
+        sourceColumn,
+        targetSchema: targetTblObj.schemaName,
+        targetTable: targetTblObj.tableName,
+        targetColumn,
+        onDelete,
+        onUpdate,
+      },
+    ];
+  }, [sourceTblObj, targetTblObj, sourceColumn, targetColumn, onDelete, onUpdate]);
+
+  const compiledFkPreview = useMemo(() => {
+    if (pendingFkOperation.length === 0) return null;
+    try {
+      return compileOperationsPlan(pendingFkOperation, snapshot);
+    } catch {
+      return null;
+    }
+  }, [pendingFkOperation, snapshot]);
+
   const handleStageRelationship = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!connection || !sourceTblObj || !targetTblObj) return;
+    if (!connection || !sourceTblObj || !targetTblObj || pendingFkOperation.length === 0) return;
     try {
-      const constraintName = `FK_${sourceTblObj.tableName}_${sourceColumn}_${targetTblObj.tableName}`;
-      await api.createPlan(connection.id, `Link ${sourceTblObj.tableName}.${sourceColumn} → ${targetTblObj.tableName}.${targetColumn}`, [
-        {
-          kind: 'ADD_FOREIGN_KEY',
-          constraintName,
-          sourceSchema: sourceTblObj.schemaName,
-          sourceTable: sourceTblObj.tableName,
-          sourceColumn,
-          targetSchema: targetTblObj.schemaName,
-          targetTable: targetTblObj.tableName,
-          targetColumn,
-          onDelete,
-          onUpdate,
-        },
-      ]);
+      await api.createPlan(
+        connection.id,
+        `Link ${sourceTblObj.tableName}.${sourceColumn} → ${targetTblObj.tableName}.${targetColumn}`,
+        pendingFkOperation
+      );
       await onPlanCreated();
       setFkModalOpen(false);
       onToast('success', 'Relationship plan staged', 'Review and apply the Foreign Key in Change Center.');
@@ -329,6 +366,38 @@ export function VisualDesignerPage({
       onToast('error', 'Invalid relationship', err instanceof Error ? err.message : 'Validation failed');
     }
   };
+
+  const handleStageDropFk = async (fk: ForeignKeySchema) => {
+    if (!connection) return;
+    try {
+      await api.createPlan(connection.id, `Drop foreign key ${fk.name}`, [
+        {
+          kind: 'DROP_FOREIGN_KEY',
+          constraintName: fk.name,
+          schemaName: fk.sourceSchema,
+          tableName: fk.sourceTable,
+        },
+      ]);
+      await onPlanCreated();
+      setSelectedFk(null);
+      onToast('info', 'Drop relationship staged', 'Review and confirm in Change Center.');
+      onNavigate('changes');
+    } catch (err) {
+      onToast('error', 'Failed to stage drop', err instanceof Error ? err.message : 'Error');
+    }
+  };
+
+  const fullSchemaSqlSummary = useMemo(() => {
+    if (!snapshot) return '';
+    return snapshot.tables
+      .map((t) => {
+        const cols = t.columns
+          .map((c) => `  [${c.name}] ${c.sqlType} ${c.nullable ? 'NULL' : 'NOT NULL'}`)
+          .join(',\n');
+        return `CREATE TABLE [${t.schemaName}].[${t.tableName}] (\n${cols}\n);`;
+      })
+      .join('\n\n');
+  }, [snapshot]);
 
   if (!connection || !snapshot) {
     return (
@@ -350,7 +419,6 @@ export function VisualDesignerPage({
 
   return (
     <div className="h-[calc(100vh-7.5rem)] flex flex-col gap-3">
-      {/* Toolbar */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
           <h1 className="font-display text-xl font-bold text-[#1B2340] dark:text-white">
@@ -383,6 +451,14 @@ export function VisualDesignerPage({
           >
             <Link2 className="h-3.5 w-3.5 text-[#6D4AFF]" />
             <span>Link Tables</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setSqlPreviewOpen(true)}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[#E2E6F0] dark:border-[#232B45] bg-white dark:bg-[#12172B] text-xs font-medium hover:bg-slate-50 dark:hover:bg-[#181F38]"
+          >
+            <Code2 className="h-3.5 w-3.5 text-[#6D4AFF]" />
+            <span>Preview Schema SQL</span>
           </button>
           <button
             type="button"
@@ -420,12 +496,10 @@ export function VisualDesignerPage({
         </div>
       </div>
 
-      {/* Responsive Desktop-First Hint */}
       <div className="md:hidden rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
-        ER diagram editing is optimized for desktop viewports; use Explorer or Records for compact mobile inspection.
+        ER diagram editing is optimized for desktop viewports; click any link to inspect or remove relationships.
       </div>
 
-      {/* React Flow Canvas */}
       <div
         data-testid="er-diagram-canvas"
         className="flex-1 rounded-xl border border-[#E2E6F0] dark:border-[#232B45] bg-white dark:bg-[#12172B] overflow-hidden"
@@ -436,6 +510,10 @@ export function VisualDesignerPage({
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={handleConnect}
+          onEdgeClick={(_event, edge) => {
+            const fk = fkByEdgeId.get(edge.id);
+            if (fk) setSelectedFk(fk);
+          }}
           nodeTypes={nodeTypes}
           fitView
         >
@@ -445,12 +523,87 @@ export function VisualDesignerPage({
         </ReactFlow>
       </div>
 
+      {/* Inspect / Drop Existing Foreign Key Modal */}
+      {selectedFk && (
+        <div role="dialog" aria-modal="true" className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/50">
+          <div className="w-full max-w-md rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] p-5 space-y-4">
+            <h2 className="font-display text-base font-semibold text-[#1B2340] dark:text-white">
+              Relationship Details
+            </h2>
+            <dl className="text-xs space-y-1.5">
+              <div className="flex justify-between">
+                <dt className="text-slate-500">Constraint</dt>
+                <dd className="font-mono font-medium">{selectedFk.name}</dd>
+              </div>
+              <div className="flex justify-between">
+                <dt className="text-slate-500">Child Reference</dt>
+                <dd className="font-mono">
+                  {selectedFk.sourceSchema}.{selectedFk.sourceTable}.{selectedFk.sourceColumn}
+                </dd>
+              </div>
+              <div className="flex justify-between">
+                <dt className="text-slate-500">Parent Key</dt>
+                <dd className="font-mono">
+                  {selectedFk.targetSchema}.{selectedFk.targetTable}.{selectedFk.targetColumn}
+                </dd>
+              </div>
+              <div className="flex justify-between">
+                <dt className="text-slate-500">Delete / Update Rule</dt>
+                <dd className="font-mono">
+                  {selectedFk.onDelete} / {selectedFk.onUpdate}
+                </dd>
+              </div>
+            </dl>
+            <div className="flex justify-between gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => handleStageDropFk(selectedFk)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#E5484D] text-white text-xs font-medium"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                <span>Stage Drop Relationship</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setSelectedFk(null)}
+                className="px-3 py-1.5 rounded-lg border border-[#E2E6F0] dark:border-[#232B45] text-xs"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Full Schema T-SQL Preview Modal */}
+      {sqlPreviewOpen && (
+        <div role="dialog" aria-modal="true" className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/50">
+          <div className="w-full max-w-3xl rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] p-5 space-y-4 max-h-[85vh] overflow-y-auto">
+            <div className="flex items-center justify-between">
+              <h2 className="font-display text-base font-semibold text-[#1B2340] dark:text-white">
+                Generated T-SQL Schema Script ({snapshot.databaseName})
+              </h2>
+              <button
+                type="button"
+                onClick={() => setSqlPreviewOpen(false)}
+                className="px-3 py-1 rounded-lg border border-[#E2E6F0] dark:border-[#232B45] text-xs"
+              >
+                Close
+              </button>
+            </div>
+            <pre className="rounded-lg bg-[#13172B] text-slate-100 p-4 text-xs font-mono whitespace-pre-wrap overflow-x-auto">
+              {fullSchemaSqlSummary}
+            </pre>
+          </div>
+        </div>
+      )}
+
       {/* Foreign Key Configuration Modal */}
       {fkModalOpen && (
         <div role="dialog" aria-modal="true" className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/50">
           <form
             onSubmit={handleStageRelationship}
-            className="w-full max-w-lg rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] p-5 space-y-4"
+            className="w-full max-w-lg rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] p-5 space-y-4 max-h-[90vh] overflow-y-auto"
           >
             <h2 className="font-display text-base font-semibold text-[#1B2340] dark:text-white">
               Configure Table Relationship (Foreign Key)
@@ -550,6 +703,12 @@ export function VisualDesignerPage({
                 </select>
               </div>
             </div>
+
+            {compiledFkPreview && (
+              <pre className="rounded-lg bg-[#13172B] text-slate-100 p-3 text-[11px] font-mono whitespace-pre-wrap">
+                {compiledFkPreview.tsql}
+              </pre>
+            )}
 
             {!typesCompatible && (
               <div className="rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900 p-2.5 text-xs text-[#E5484D]">

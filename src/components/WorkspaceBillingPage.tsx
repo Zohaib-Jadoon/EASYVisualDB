@@ -1,10 +1,19 @@
-import React, { useState } from 'react';
-import { Shield, UserPlus } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { CreditCard, Database, MailPlus, Shield } from 'lucide-react';
 import { api } from '../lib/api';
-import { PlanTier, WorkspaceRole, WorkspaceSummary } from '../shared/types';
+import {
+  BillingCheckoutSession,
+  PlanTier,
+  WorkspaceInvitation,
+  WorkspaceRole,
+  WorkspaceSummary,
+} from '../shared/types';
 
 interface WorkspaceBillingPageProps {
   workspace: WorkspaceSummary | null;
+  migrations: Array<{ id: string; name: string; appliedAt: string }>;
+  billingProviderConfigured: boolean;
+  billingEvents: BillingCheckoutSession[];
   onRefreshWorkspace: () => Promise<void>;
   onToast: (tone: 'success' | 'error' | 'info', title: string, detail?: string) => void;
 }
@@ -48,12 +57,25 @@ const PLAN_OPTIONS: Array<{
 
 export function WorkspaceBillingPage({
   workspace,
+  migrations,
+  billingProviderConfigured,
+  billingEvents,
   onRefreshWorkspace,
   onToast,
 }: WorkspaceBillingPageProps) {
   const [inviteName, setInviteName] = useState('');
   const [inviteEmail, setInviteEmail] = useState('');
   const [inviteRole, setInviteRole] = useState<WorkspaceRole>('Designer');
+  const [invitations, setInvitations] = useState<WorkspaceInvitation[]>([]);
+  const [issuedInviteToken, setIssuedInviteToken] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!workspace) return;
+    api
+      .listInvitations()
+      .then((res) => setInvitations(res.invitations || []))
+      .catch(() => setInvitations([]));
+  }, [workspace?.id]);
 
   if (!workspace) return null;
 
@@ -61,16 +83,23 @@ export function WorkspaceBillingPage({
     workspace.currentActor.role === 'Owner' || workspace.currentActor.role === 'Admin';
   const isOwner = workspace.currentActor.role === 'Owner';
 
-  const handleInvite = async (e: React.FormEvent) => {
+  const handleSendInvite = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      await api.addMember({ name: inviteName, email: inviteEmail, role: inviteRole });
+      const res = await api.createInvitation({
+        name: inviteName,
+        email: inviteEmail,
+        role: inviteRole,
+      });
+      setIssuedInviteToken(res.inviteToken);
       setInviteName('');
       setInviteEmail('');
+      const invRes = await api.listInvitations();
+      setInvitations(invRes.invitations || []);
       await onRefreshWorkspace();
-      onToast('success', 'Member added', `${inviteName} joined as ${inviteRole}.`);
+      onToast('success', 'Team invitation created', 'Share the one-time invite token so the member can register & join.');
     } catch (err) {
-      onToast('error', 'Failed to add member', err instanceof Error ? err.message : 'Error');
+      onToast('error', 'Failed to create invitation', err instanceof Error ? err.message : 'Error');
     }
   };
 
@@ -98,6 +127,16 @@ export function WorkspaceBillingPage({
     }
   };
 
+  const handleStartCheckout = async (tier: PlanTier) => {
+    try {
+      const res = await api.createBillingCheckout(tier);
+      await onRefreshWorkspace();
+      onToast('info', `Billing checkout session created (${res.checkout.provider})`, res.checkout.note);
+    } catch (err) {
+      onToast('error', 'Checkout failed', err instanceof Error ? err.message : 'Error');
+    }
+  };
+
   return (
     <div className="max-w-6xl mx-auto space-y-6">
       <div>
@@ -109,7 +148,7 @@ export function WorkspaceBillingPage({
         </p>
       </div>
 
-      {/* Team RBAC Table */}
+      {/* Team RBAC Table + Invitations */}
       <section className="rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] p-5 space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
           <h2 className="font-display text-sm font-semibold text-[#1B2340] dark:text-white">
@@ -184,7 +223,7 @@ export function WorkspaceBillingPage({
         </div>
 
         {isPrivileged && (
-          <form onSubmit={handleInvite} className="grid grid-cols-1 sm:grid-cols-4 gap-2.5 pt-2">
+          <form onSubmit={handleSendInvite} className="grid grid-cols-1 sm:grid-cols-4 gap-2.5 pt-2">
             <input
               type="text"
               required
@@ -215,10 +254,36 @@ export function WorkspaceBillingPage({
               type="submit"
               className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#6D4AFF] text-white text-xs font-medium"
             >
-              <UserPlus className="h-3.5 w-3.5" />
-              <span>Add Member</span>
+              <MailPlus className="h-3.5 w-3.5" />
+              <span>Issue Team Invite</span>
             </button>
           </form>
+        )}
+
+        {issuedInviteToken && (
+          <div className="rounded-lg border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/30 p-3 text-xs space-y-1">
+            <div className="font-semibold text-amber-900 dark:text-amber-200">
+              One-Time Invitation Token (Use "Accept Invite" in Sign In modal)
+            </div>
+            <div className="font-mono select-all text-amber-950 dark:text-amber-100">{issuedInviteToken}</div>
+          </div>
+        )}
+
+        {invitations.length > 0 && (
+          <div className="pt-2 border-t border-[#E2E6F0] dark:border-[#232B45] space-y-1.5">
+            <div className="text-[11px] font-medium text-slate-400">Issued Workspace Invitations</div>
+            {invitations.map((inv) => (
+              <div key={inv.id} className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                <div>
+                  <span className="font-medium text-[#1B2340] dark:text-white">{inv.name}</span>{' '}
+                  <span className="text-slate-500">({inv.email})</span>
+                </div>
+                <div className="text-slate-500 font-mono text-[11px]">
+                  {inv.role} · {inv.status} · Token: {inv.tokenPreview}
+                </div>
+              </div>
+            ))}
+          </div>
         )}
       </section>
 
@@ -275,16 +340,18 @@ export function WorkspaceBillingPage({
         </div>
       </section>
 
-      {/* Subscription Plans & Entitlements */}
+      {/* Subscription Plans & Billing Provider Integration */}
       <section className="rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] p-5 space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
           <div>
-            <h2 className="font-display text-sm font-semibold text-[#1B2340] dark:text-white">
-              Commercial Plan & Entitlements (Proposed Pricing)
+            <h2 className="font-display text-sm font-semibold text-[#1B2340] dark:text-white flex items-center gap-2">
+              <CreditCard className="h-4 w-4 text-[#6D4AFF]" />
+              <span>Commercial Plan, Entitlements & Billing Provider</span>
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
               Active usage: <span className="tabular-nums">{workspace.subscription.connectionsUsed}</span> of{' '}
-              <span className="tabular-nums">{workspace.subscription.connectionsLimit}</span> connection(s). Downgrades never drop customer databases.
+              <span className="tabular-nums">{workspace.subscription.connectionsLimit}</span> connection(s) ·{' '}
+              {billingProviderConfigured ? 'External Checkout Configured' : 'Local Entitlement Mode'}
             </p>
           </div>
         </div>
@@ -314,21 +381,68 @@ export function WorkspaceBillingPage({
                   </p>
                 </div>
 
-                <button
-                  type="button"
-                  disabled={isCurrent || !isOwner}
-                  onClick={() => handleSelectPlan(plan.tier)}
-                  className={`w-full py-2 rounded-lg text-xs font-medium transition-colors ${
-                    isCurrent
-                      ? 'bg-[#6D4AFF]/15 text-[#6D4AFF] cursor-default'
-                      : 'bg-[#1B2340] dark:bg-[#6D4AFF] text-white hover:opacity-90 disabled:opacity-40'
-                  }`}
-                >
-                  {isCurrent ? 'Current Plan' : 'Select Plan'}
-                </button>
+                <div className="space-y-1.5">
+                  <button
+                    type="button"
+                    disabled={isCurrent || !isOwner}
+                    onClick={() => handleSelectPlan(plan.tier)}
+                    className={`w-full py-2 rounded-lg text-xs font-medium transition-colors ${
+                      isCurrent
+                        ? 'bg-[#6D4AFF]/15 text-[#6D4AFF] cursor-default'
+                        : 'bg-[#1B2340] dark:bg-[#6D4AFF] text-white hover:opacity-90 disabled:opacity-40'
+                    }`}
+                  >
+                    {isCurrent ? 'Current Plan' : 'Apply Plan Entitlement'}
+                  </button>
+                  {!isCurrent && isOwner && (
+                    <button
+                      type="button"
+                      onClick={() => handleStartCheckout(plan.tier)}
+                      className="w-full py-1.5 rounded-lg border border-[#E2E6F0] dark:border-[#232B45] text-[11px] font-medium hover:bg-slate-50 dark:hover:bg-[#181F38]"
+                    >
+                      Create Checkout Session
+                    </button>
+                  )}
+                </div>
               </div>
             );
           })}
+        </div>
+
+        {billingEvents.length > 0 && (
+          <div className="pt-3 border-t border-[#E2E6F0] dark:border-[#232B45] space-y-1.5">
+            <div className="text-[11px] font-medium text-slate-400">Recent Billing Sessions</div>
+            {billingEvents.slice(0, 4).map((ev) => (
+              <div key={ev.id} className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                <span>
+                  Tier <strong className="capitalize">{ev.targetTier}</strong> · {ev.provider}
+                </span>
+                <span className="text-slate-500 font-mono text-[11px]">
+                  {ev.status} · {new Date(ev.createdAt).toLocaleString()}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {/* SaaS Control-Plane Migrations */}
+      <section className="rounded-xl bg-white dark:bg-[#12172B] border border-[#E2E6F0] dark:border-[#232B45] p-5 space-y-3">
+        <h2 className="font-display text-sm font-semibold text-[#1B2340] dark:text-white flex items-center gap-2">
+          <Database className="h-4 w-4 text-[#6D4AFF]" />
+          <span>Control-Plane Schema Migrations ({migrations.length} applied)</span>
+        </h2>
+        <div className="divide-y divide-[#E2E6F0] dark:divide-[#232B45]">
+          {migrations.map((mig) => (
+            <div key={mig.id} className="py-2 flex items-center justify-between text-xs">
+              <span className="font-mono text-[#1B2340] dark:text-slate-200">
+                {mig.id}_{mig.name}
+              </span>
+              <span className="font-mono text-slate-400 text-[11px] tabular-nums">
+                Applied {new Date(mig.appliedAt).toLocaleString()}
+              </span>
+            </div>
+          ))}
         </div>
       </section>
     </div>

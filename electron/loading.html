@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'none';"
+    />
+    <title>Visual Database Studio — Starting</title>
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #13172B;
+        color: #F8FAFC;
+        font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      }
+      .card {
+        width: 420px;
+        padding: 32px;
+        border-radius: 14px;
+        background: #1B213C;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        text-align: center;
+      }
+      .mark {
+        width: 48px;
+        height: 48px;
+        margin: 0 auto 16px;
+        border-radius: 12px;
+        background: #6D4AFF;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 700;
+        font-size: 22px;
+        color: #FFFFFF;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 18px;
+        font-weight: 600;
+      }
+      p {
+        margin: 0;
+        font-size: 13px;
+        color: #94A3B8;
+        line-height: 1.5;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="mark">V</div>
+      <h1>Visual Database Studio</h1>
+      <p>Initializing local SQLite control plane, verifying migrations, and starting the isolated SQL Server engine...</p>
+    </div>
+  </body>
+</html>

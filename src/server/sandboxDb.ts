@@ -7,8 +7,10 @@ import {
   ForeignKeySchema,
   IndexSchema,
   QueryExecutionResult,
+  RecordColumnFilter,
   SchemaOperation,
   SchemaSnapshot,
+  TableDependency,
   TableSchema,
 } from '../shared/types';
 import {
@@ -20,7 +22,9 @@ import {
   validateSqlStatement,
 } from '../shared/sqlCompiler';
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
+const DATA_DIR = process.env.VDS_DATA_DIR
+  ? path.resolve(process.env.VDS_DATA_DIR)
+  : path.resolve(process.cwd(), 'data');
 const SANDBOX_DB_PATH = path.join(DATA_DIR, 'sandbox-northwind.db');
 
 export class SandboxDatabaseEngine {
@@ -32,6 +36,17 @@ export class SandboxDatabaseEngine {
     this.db = new DatabaseSync(SANDBOX_DB_PATH);
     this.db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;');
     return this.db;
+  }
+
+  close(): void {
+    if (this.db) {
+      try {
+        this.db.close();
+      } catch {
+        // ignore already closed
+      }
+      this.db = null;
+    }
   }
 
   ensureSeeded(): void {
@@ -293,6 +308,7 @@ export class SandboxDatabaseEngine {
     sortColumn?: string;
     sortDir?: 'ASC' | 'DESC';
     search?: string;
+    filters?: RecordColumnFilter[];
     columns: string[];
   }): { rows: Record<string, unknown>[]; totalRows: number } {
     this.ensureSeeded();
@@ -303,16 +319,34 @@ export class SandboxDatabaseEngine {
     const offset = Math.max((params.page || 1) - 1, 0) * safeLimit;
 
     const bindValues: Array<string | number> = [];
-    let whereSql = '';
+    const whereClauses: string[] = [];
+
     if (params.search && params.search.trim() !== '') {
       const term = `%${params.search.trim()}%`;
       const likes = params.columns.map((c) => `CAST(${quoteSqliteIdentifier(c)} AS TEXT) LIKE ?`);
-      whereSql = `WHERE (${likes.join(' OR ')})`;
+      whereClauses.push(`(${likes.join(' OR ')})`);
       for (let i = 0; i < params.columns.length; i += 1) {
         bindValues.push(term);
       }
     }
 
+    if (params.filters && params.filters.length > 0) {
+      for (const f of params.filters) {
+        const colSql = quoteSqliteIdentifier(f.column);
+        if (f.operator === 'is_null') whereClauses.push(`${colSql} IS NULL`);
+        else if (f.operator === 'is_not_null') whereClauses.push(`${colSql} IS NOT NULL`);
+        else if (f.operator === 'contains') {
+          whereClauses.push(`CAST(${colSql} AS TEXT) LIKE ?`);
+          bindValues.push(`%${f.value}%`);
+        } else {
+          const opMap: Record<'eq' | 'neq' | 'gt' | 'lt', string> = { eq: '=', neq: '!=', gt: '>', lt: '<' };
+          whereClauses.push(`${colSql} ${opMap[f.operator]} ?`);
+          bindValues.push(f.value);
+        }
+      }
+    }
+
+    const whereSql = whereClauses.length ? `WHERE ${whereClauses.join(' AND ')}` : '';
     const orderSql =
       params.sortColumn && validateIdentifier(params.sortColumn).valid
         ? `ORDER BY ${quoteSqliteIdentifier(params.sortColumn)} ${params.sortDir === 'DESC' ? 'DESC' : 'ASC'}`
@@ -327,6 +361,88 @@ export class SandboxDatabaseEngine {
       .all(...bindValues, safeLimit, offset) as Record<string, unknown>[];
 
     return { rows, totalRows: countRow.total };
+  }
+
+  bulkUpdateRows(params: {
+    schemaName: string;
+    tableName: string;
+    pkColumn: string;
+    pkValues: Array<string | number>;
+    column: string;
+    value: unknown;
+  }): { updatedCount: number } {
+    this.ensureSeeded();
+    const db = this.open();
+    if (params.pkValues.length === 0) return { updatedCount: 0 };
+    const tableSql = quoteSqliteQualifiedTable(params.schemaName, params.tableName);
+    const colSql = quoteSqliteIdentifier(params.column);
+    const pkSql = quoteSqliteIdentifier(params.pkColumn);
+    const placeholders = params.pkValues.map(() => '?').join(', ');
+    const normalizedVal =
+      typeof params.value === 'boolean' ? (params.value ? 1 : 0) : params.value === undefined ? null : (params.value as string | number | null);
+    const res = db
+      .prepare(`UPDATE ${tableSql} SET ${colSql} = ? WHERE ${pkSql} IN (${placeholders})`)
+      .run(normalizedVal, ...params.pkValues);
+    return { updatedCount: Number(res.changes) };
+  }
+
+  getDependencies(schemaName: string, tableName: string): TableDependency[] {
+    const snap = this.introspect('sandbox');
+    const targetFull = `${schemaName}.${tableName}`.toLowerCase();
+    const deps: TableDependency[] = [];
+    for (const tbl of snap.tables) {
+      for (const fk of tbl.foreignKeys) {
+        const srcFull = `${fk.sourceSchema}.${fk.sourceTable}`.toLowerCase();
+        const tgtFull = `${fk.targetSchema}.${fk.targetTable}`.toLowerCase();
+        if (srcFull === targetFull) {
+          deps.push({
+            direction: 'referenced',
+            objectName: `${fk.targetSchema}.${fk.targetTable}`,
+            objectType: 'FOREIGN_KEY',
+            constraintName: fk.name,
+            detail: `${fk.sourceTable}.${fk.sourceColumn} -> ${fk.targetTable}.${fk.targetColumn}`,
+          });
+        } else if (tgtFull === targetFull) {
+          deps.push({
+            direction: 'referencing',
+            objectName: `${fk.sourceSchema}.${fk.sourceTable}`,
+            objectType: 'FOREIGN_KEY',
+            constraintName: fk.name,
+            detail: `${fk.sourceTable}.${fk.sourceColumn} -> ${fk.targetTable}.${fk.targetColumn}`,
+          });
+        }
+      }
+    }
+    return deps;
+  }
+
+  renameObject(params: { schemaName: string; tableName: string; columnName?: string; newName: string }): string {
+    this.ensureSeeded();
+    const db = this.open();
+    const s = validateIdentifier(params.schemaName, 'Schema');
+    const t = validateIdentifier(params.tableName, 'Table');
+    const n = validateIdentifier(params.newName, 'New name');
+    if (!s.valid) throw new Error(s.error);
+    if (!t.valid) throw new Error(t.error);
+    if (!n.valid) throw new Error(n.error);
+
+    if (params.columnName) {
+      const c = validateIdentifier(params.columnName, 'Column');
+      if (!c.valid) throw new Error(c.error);
+      db.exec(
+        `ALTER TABLE ${quoteSqliteQualifiedTable(s.value, t.value)} RENAME COLUMN ${quoteSqliteIdentifier(
+          c.value
+        )} TO ${quoteSqliteIdentifier(n.value)};`
+      );
+      return `Renamed sandbox column ${s.value}.${t.value}.${c.value} to ${n.value}.`;
+    }
+    db.exec(
+      `ALTER TABLE ${quoteSqliteQualifiedTable(s.value, t.value)} RENAME TO ${quoteSqliteQualifiedTable(
+        s.value,
+        n.value
+      )};`
+    );
+    return `Renamed sandbox table ${s.value}.${t.value} to ${s.value}.${n.value}.`;
   }
 
   insertRow(schemaName: string, tableName: string, values: Record<string, unknown>): void {
@@ -472,6 +588,18 @@ export class SandboxDatabaseEngine {
   applyOperations(operations: SchemaOperation[], snapshot: SchemaSnapshot): string {
     this.ensureSeeded();
     const db = this.open();
+    for (const op of operations) {
+      if (op.kind === 'CREATE_DATABASE') {
+        throw new Error(
+          'CREATE DATABASE is a Microsoft SQL Server instance operation and is not supported on the single-file SQLite learning sandbox.'
+        );
+      }
+      if (op.kind === 'ALTER_COLUMN' || op.kind === 'ADD_PRIMARY_KEY' || op.kind === 'DROP_CONSTRAINT') {
+        throw new Error(
+          `Operation "${op.kind}" requires Microsoft SQL Server T-SQL and cannot be altered in-place on SQLite.`
+        );
+      }
+    }
     const compiled = compileOperationsPlan(operations, snapshot);
     if (!compiled.preflight.passed) {
       const firstFail = compiled.preflight.checks.find((c) => c.status === 'fail');
@@ -483,17 +611,58 @@ export class SandboxDatabaseEngine {
       for (const stmt of compiled.sqliteStatements) {
         db.exec(stmt);
       }
-      // Handle ADD_FOREIGN_KEY in SQLite sandbox by rebuilding child table schema with FK constraint safely
       for (const op of operations) {
         if (op.kind === 'ADD_FOREIGN_KEY') {
           this.addForeignKeyInSqlite(op);
+        } else if (op.kind === 'DROP_FOREIGN_KEY') {
+          this.dropForeignKeyInSqlite(op, snapshot);
         }
       }
       db.exec('COMMIT;');
-      return `Executed ${operations.length} operation(s) cleanly in transaction.`;
+      return `Executed ${operations.length} operation(s) cleanly in sandbox transaction.`;
     } catch (err) {
       db.exec('ROLLBACK;');
       throw err;
+    }
+  }
+
+  private dropForeignKeyInSqlite(
+    op: Extract<SchemaOperation, { kind: 'DROP_FOREIGN_KEY' }>,
+    snapshot: SchemaSnapshot
+  ) {
+    const db = this.open();
+    const fullSrc = `${op.schemaName}.${op.tableName}`;
+    const tbl = snapshot.tables.find((t) => t.fullName.toLowerCase() === fullSrc.toLowerCase());
+    const fk = tbl?.foreignKeys.find((f) => f.name === op.constraintName);
+    if (!fk) throw new Error(`Foreign key "${op.constraintName}" not found on ${fullSrc}.`);
+
+    const createRow = db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`)
+      .get(fullSrc) as { sql: string } | undefined;
+    if (!createRow?.sql) throw new Error(`Table ${fullSrc} not found.`);
+
+    const targetPattern = new RegExp(
+      `,?\\s*FOREIGN KEY\\s*\\(\\s*"?${fk.sourceColumn}"?\\s*\\)\\s*REFERENCES\\s*"?(?:${fk.targetSchema}\\.)?${fk.targetTable}"?\\s*\\(\\s*"?${fk.targetColumn}"?\\s*\\)(?:\\s+ON\\s+DELETE\\s+(?:NO ACTION|CASCADE|SET NULL))?(?:\\s+ON\\s+UPDATE\\s+(?:NO ACTION|CASCADE))?`,
+      'i'
+    );
+    const cleanedSql = createRow.sql.replace(targetPattern, '');
+    if (cleanedSql === createRow.sql) {
+      throw new Error(`Could not locate foreign key clause for "${op.constraintName}" in SQLite definition.`);
+    }
+
+    const tempName = `_vds_tmp_${op.tableName}_${Date.now()}`;
+    const tempSql = cleanedSql
+      .replace(`CREATE TABLE "${fullSrc}"`, `CREATE TABLE "${tempName}"`)
+      .replace(`CREATE TABLE ${fullSrc}`, `CREATE TABLE "${tempName}"`);
+
+    db.exec('PRAGMA foreign_keys = OFF;');
+    try {
+      db.exec(tempSql);
+      db.exec(`INSERT INTO "${tempName}" SELECT * FROM "${fullSrc}";`);
+      db.exec(`DROP TABLE "${fullSrc}";`);
+      db.exec(`ALTER TABLE "${tempName}" RENAME TO "${fullSrc}";`);
+    } finally {
+      db.exec('PRAGMA foreign_keys = ON;');
     }
   }
 

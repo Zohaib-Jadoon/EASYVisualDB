@@ -1,0 +1,44 @@
+appId: com.visualdatastudio.desktop
+productName: Visual Database Studio
+copyright: Copyright © 2026 Visual Database Studio
+directories:
+  output: release
+  buildResources: electron/assets
+files:
+  - dist/**/*
+  - dist-electron/**/*
+  - electron/loading.html
+  - electron/assets/**/*
+  - package.json
+  - "!dist/**/*.map"
+  - "!src/**/*"
+  - "!agent/**/*"
+  - "!docs/**/*"
+  - "!data/**/*"
+  - "!scripts/**/*"
+  - "!.playwright-cli/**/*"
+  - "!.aistudio/**/*"
+asar: true
+npmRebuild: false
+win:
+  icon: electron/assets/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+nsis:
+  artifactName: VisualDatabaseStudio-Setup-${version}.exe
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Visual Database Studio
+  deleteAppDataOnUninstall: false
+portable:
+  artifactName: VisualDatabaseStudio-Portable-${version}.exe
+# Auto-update publishing stays disabled until a real signed HTTPS release feed is configured.
+publish: null

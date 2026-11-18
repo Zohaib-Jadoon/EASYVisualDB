@@ -6,11 +6,14 @@ import {
   ConnectionCapabilities,
   ConnectionDiagnosticStep,
   ConnectionProfile,
+  DatabaseInfo,
   ForeignKeySchema,
   IndexSchema,
   QueryExecutionResult,
+  RecordColumnFilter,
   SchemaOperation,
   SchemaSnapshot,
+  TableDependency,
   TableSchema,
 } from '../shared/types';
 import {
@@ -23,10 +26,13 @@ import {
 
 export interface MssqlConnectInput {
   host: string;
+  instanceName?: string | null;
   port: number;
   database: string;
+  authMethod?: ConnectionProfile['authMethod'];
   username: string;
   password: string;
+  domain?: string | null;
   encrypt: boolean;
   trustServerCertificate: boolean;
   timeoutMs?: number;
@@ -66,20 +72,80 @@ async function testTcpReachability(host: string, port: number, timeoutMs = 4000)
   });
 }
 
-function buildMssqlConfig(input: MssqlConnectInput): sql.config {
-  return {
-    server: input.host.trim(),
-    port: input.port || 1433,
-    database: input.database.trim(),
-    user: input.username.trim(),
-    password: input.password,
+export function buildMssqlConfig(input: MssqlConnectInput, requestTimeoutMs = 15000): sql.config {
+  const rawHost = input.host.trim();
+  let serverHost = rawHost;
+  let instanceName = input.instanceName?.trim() || undefined;
+
+  if (!instanceName && rawHost.includes('\\')) {
+    const [h, inst] = rawHost.split('\\', 2);
+    serverHost = h.trim();
+    instanceName = inst?.trim() || undefined;
+  }
+
+  const baseOptions: sql.config['options'] = {
+    encrypt: input.encrypt,
+    trustServerCertificate: input.trustServerCertificate,
+    enableArithAbort: true,
+    ...(instanceName && instanceName.toUpperCase() !== 'MSSQLSERVER' ? { instanceName } : {}),
+  };
+
+  const config: sql.config = {
+    server: serverHost,
+    ...(instanceName && instanceName.toUpperCase() !== 'MSSQLSERVER' ? {} : { port: input.port || 1433 }),
+    database: input.database.trim() || 'master',
     connectionTimeout: input.timeoutMs ?? 8000,
-    requestTimeout: 15000,
-    options: {
-      encrypt: input.encrypt,
-      trustServerCertificate: input.trustServerCertificate,
-      enableArithAbort: true,
-    },
+    requestTimeout: requestTimeoutMs,
+    options: baseOptions,
+  };
+
+  if (input.authMethod === 'windows_integrated') {
+    const domainPart = input.domain?.trim() || (input.username.includes('\\') ? input.username.split('\\')[0] : '');
+    const userPart = input.username.includes('\\') ? input.username.split('\\')[1] : input.username.trim();
+    if (!userPart || !input.password) {
+      throw new Error(
+        'Windows Integrated Authentication via remote TDS requires Domain, Username, and Password (NTLM), or deploy the Windows Connector Agent directly on the Windows host under a trusted Windows service account.'
+      );
+    }
+    config.authentication = {
+      type: 'ntlm',
+      options: {
+        domain: domainPart,
+        userName: userPart,
+        password: input.password,
+      },
+    };
+  } else if (input.authMethod === 'entra_id') {
+    config.authentication = {
+      type: 'azure-active-directory-password',
+      options: {
+        userName: input.username.trim(),
+        password: input.password,
+        clientId: process.env.AZURE_CLIENT_ID || '',
+        tenantId: process.env.AZURE_TENANT_ID || '',
+      },
+    };
+  } else {
+    config.user = input.username.trim();
+    config.password = input.password;
+  }
+
+  return config;
+}
+
+function profileToInput(connection: ConnectionProfile, password: string): MssqlConnectInput {
+  return {
+    host: connection.host,
+    instanceName: connection.instanceName,
+    port: connection.port,
+    database: connection.database,
+    authMethod: connection.authMethod,
+    username: connection.username,
+    password,
+    domain: connection.domain,
+    encrypt: connection.encrypt,
+    trustServerCertificate: connection.trustServerCertificate,
+    timeoutMs: connection.timeoutMs,
   };
 }
 
@@ -113,56 +179,70 @@ export async function diagnoseMssqlConnection(input: MssqlConnectInput): Promise
     return { ok: false, steps, engineVersion, capabilities, accessibleDatabases };
   }
 
-  // Step 1: TCP reachability
-  try {
-    const ms = await testTcpReachability(input.host.trim(), input.port || 1433);
+  const hostOnly = input.host.includes('\\') ? input.host.split('\\', 2)[0] : input.host.trim();
+  const hasNamedInstance = Boolean(input.instanceName?.trim() || input.host.includes('\\'));
+
+  // Step 1: TCP reachability (for default/explicit port; named instances use SQL Browser UDP 1434 first)
+  if (!hasNamedInstance) {
+    try {
+      const ms = await testTcpReachability(hostOnly, input.port || 1433, input.timeoutMs ?? 4000);
+      steps.push({
+        step: 'reachability',
+        label: 'Hostname & TCP Port Reachability',
+        status: 'passed',
+        detail: `TCP handshake succeeded to ${hostOnly}:${input.port || 1433} in ${ms}ms.`,
+        durationMs: ms,
+      });
+    } catch (err) {
+      steps.push({
+        step: 'reachability',
+        label: 'Hostname & TCP Port Reachability',
+        status: 'failed',
+        detail:
+          err instanceof Error
+            ? `Unreachable host/port: ${err.message}. Verify SQL Server TCP/IP is enabled, firewall port ${input.port || 1433}, or use the Windows Connector Agent.`
+            : 'Unreachable host.',
+        durationMs: 1,
+      });
+      steps.push({
+        step: 'tls',
+        label: 'TLS Certificate Validation',
+        status: 'skipped',
+        detail: 'Skipped because host is unreachable.',
+        durationMs: 0,
+      });
+      steps.push({
+        step: 'authentication',
+        label: input.authMethod === 'windows_integrated' ? 'Windows Authentication' : 'SQL Authentication',
+        status: 'skipped',
+        detail: 'Skipped because host is unreachable.',
+        durationMs: 0,
+      });
+      steps.push({
+        step: 'permissions',
+        label: 'Metadata & Permission Probe',
+        status: 'skipped',
+        detail: 'Skipped because host is unreachable.',
+        durationMs: 0,
+      });
+      return { ok: false, steps, engineVersion, capabilities, accessibleDatabases };
+    }
+  } else {
     steps.push({
       step: 'reachability',
-      label: 'Hostname & TCP Port Reachability',
+      label: 'Named Instance & SQL Browser Lookup',
       status: 'passed',
-      detail: `TCP handshake succeeded to ${input.host}:${input.port || 1433} in ${ms}ms.`,
-      durationMs: ms,
-    });
-  } catch (err) {
-    steps.push({
-      step: 'reachability',
-      label: 'Hostname & TCP Port Reachability',
-      status: 'failed',
-      detail:
-        err instanceof Error
-          ? `Unreachable host/port: ${err.message}. Verify firewall rules or use the Windows Connector Agent for private networks.`
-          : 'Unreachable host.',
+      detail: `Resolving named instance "${input.instanceName || input.host.split('\\')[1]}" on "${hostOnly}" via SQL Server Browser.`,
       durationMs: 1,
     });
-    steps.push({
-      step: 'tls',
-      label: 'TLS Certificate Validation',
-      status: 'skipped',
-      detail: 'Skipped because host is unreachable.',
-      durationMs: 0,
-    });
-    steps.push({
-      step: 'authentication',
-      label: 'SQL Authentication',
-      status: 'skipped',
-      detail: 'Skipped because host is unreachable.',
-      durationMs: 0,
-    });
-    steps.push({
-      step: 'permissions',
-      label: 'Metadata & Permission Probe',
-      status: 'skipped',
-      detail: 'Skipped because host is unreachable.',
-      durationMs: 0,
-    });
-    return { ok: false, steps, engineVersion, capabilities, accessibleDatabases };
   }
 
   // Step 2 & 3: TLS + Authentication via mssql pool
   let pool: sql.ConnectionPool | null = null;
   const authStart = performance.now();
   try {
-    pool = await new sql.ConnectionPool(buildMssqlConfig(input)).connect();
+    const cfg = buildMssqlConfig(input);
+    pool = await new sql.ConnectionPool(cfg).connect();
     const elapsed = Math.max(1, Math.round(performance.now() - authStart));
     steps.push({
       step: 'tls',
@@ -170,16 +250,16 @@ export async function diagnoseMssqlConnection(input: MssqlConnectInput): Promise
       status: input.encrypt ? 'passed' : 'failed',
       detail: input.encrypt
         ? input.trustServerCertificate
-          ? 'Encrypted TLS session established (self-signed certificate override active).'
+          ? 'Encrypted TLS session established (explicit self-signed certificate trust enabled).'
           : 'Encrypted TLS session verified against trusted certificate chain.'
-        : 'TLS encryption disabled — encrypted transport is recommended for production.',
+        : 'TLS encryption disabled — enable TLS encryption for production environments.',
       durationMs: Math.round(elapsed / 2),
     });
     steps.push({
       step: 'authentication',
-      label: 'SQL Authentication',
+      label: input.authMethod === 'windows_integrated' ? 'Windows Authentication' : input.authMethod === 'entra_id' ? 'Microsoft Entra ID' : 'SQL Authentication',
       status: 'passed',
-      detail: `Authenticated as "${input.username}" on database "${input.database}".`,
+      detail: `Authenticated as "${input.username || 'Integrated Account'}" on database "${input.database || 'master'}".`,
       durationMs: Math.round(elapsed / 2),
     });
   } catch (err) {
@@ -190,13 +270,13 @@ export async function diagnoseMssqlConnection(input: MssqlConnectInput): Promise
       label: 'TLS Certificate Validation',
       status: isCertErr ? 'failed' : 'passed',
       detail: isCertErr
-        ? `TLS certificate validation failed: ${msg}`
+        ? `TLS certificate validation failed (never silently bypassed): ${msg}`
         : 'TLS transport negotiated.',
       durationMs: Math.max(1, Math.round(performance.now() - authStart)),
     });
     steps.push({
       step: 'authentication',
-      label: 'SQL Authentication',
+      label: input.authMethod === 'windows_integrated' ? 'Windows Authentication' : 'SQL Authentication',
       status: isCertErr ? 'skipped' : 'failed',
       detail: isCertErr
         ? 'Skipped due to TLS certificate failure.'
@@ -239,14 +319,14 @@ export async function diagnoseMssqlConnection(input: MssqlConnectInput): Promise
 
     const dbListRes = await pool
       .request()
-      .query(`SELECT name FROM sys.databases WHERE HAS_DBACCESS(name) = 1 ORDER BY name`);
+      .query(`SELECT name FROM sys.databases WHERE HAS_DBACCESS(name) = 1 AND state_desc = 'ONLINE' ORDER BY name`);
     accessibleDatabases = dbListRes.recordset.map((r) => String(r.name));
 
     steps.push({
       step: 'permissions',
       label: 'Metadata & Permission Probe',
       status: 'passed',
-      detail: `Discovered permissions — Metadata: ${capabilities.canReadMetadata ? 'Yes' : 'No'}, Read: ${capabilities.canReadData ? 'Yes' : 'No'}, Write Data: ${capabilities.canWriteData ? 'Yes' : 'No'}, Schema DDL: ${capabilities.canModifySchema ? 'Yes' : 'No'}.`,
+      detail: `Found ${accessibleDatabases.length} accessible database(s). Privileges — Metadata: ${capabilities.canReadMetadata ? 'Yes' : 'No'}, Read: ${capabilities.canReadData ? 'Yes' : 'No'}, Write Data: ${capabilities.canWriteData ? 'Yes' : 'No'}, Schema DDL: ${capabilities.canModifySchema ? 'Yes' : 'No'}.`,
       durationMs: Math.max(1, Math.round(performance.now() - permStart)),
     });
 
@@ -265,21 +345,173 @@ export async function diagnoseMssqlConnection(input: MssqlConnectInput): Promise
   }
 }
 
+export async function listMssqlDatabases(
+  connection: ConnectionProfile,
+  password: string
+): Promise<DatabaseInfo[]> {
+  const pool = await new sql.ConnectionPool(buildMssqlConfig(profileToInput(connection, password))).connect();
+  try {
+    const res = await pool.request().query(`
+      SELECT
+        d.name,
+        d.state_desc AS stateDesc,
+        d.recovery_model_desc AS recoveryModel,
+        d.compatibility_level AS compatibilityLevel,
+        ISNULL(d.collation_name, '') AS collationName,
+        CONVERT(DECIMAL(12,2), ISNULL(SUM(mf.size) * 8.0 / 1024.0, 0)) AS sizeMb,
+        CONVERT(VARCHAR(30), d.create_date, 126) AS createDate,
+        d.is_read_only AS isReadOnly,
+        CASE WHEN d.database_id <= 4 THEN 1 ELSE 0 END AS isSystem,
+        ISNULL(SUSER_SNAME(d.owner_sid), '') AS ownerName
+      FROM sys.databases d
+      LEFT JOIN sys.master_files mf ON d.database_id = mf.database_id
+      WHERE HAS_DBACCESS(d.name) = 1
+      GROUP BY d.name, d.state_desc, d.recovery_model_desc, d.compatibility_level, d.collation_name, d.create_date, d.is_read_only, d.database_id, d.owner_sid
+      ORDER BY isSystem ASC, d.name ASC
+    `);
+    return res.recordset.map((r) => ({
+      name: String(r.name),
+      stateDesc: String(r.stateDesc),
+      recoveryModel: String(r.recoveryModel),
+      compatibilityLevel: Number(r.compatibilityLevel),
+      collationName: String(r.collationName),
+      sizeMb: Number(r.sizeMb ?? 0),
+      createDate: String(r.createDate),
+      isReadOnly: Boolean(r.isReadOnly),
+      isSystem: Boolean(r.isSystem),
+      ownerName: r.ownerName ? String(r.ownerName) : undefined,
+    }));
+  } finally {
+    await pool.close().catch(() => undefined);
+  }
+}
+
+export async function createMssqlDatabase(
+  connection: ConnectionProfile,
+  password: string,
+  dbName: string,
+  collation?: string
+): Promise<string> {
+  const check = validateIdentifier(dbName, 'Database name');
+  if (!check.valid) throw new Error(check.error);
+  const input = { ...profileToInput(connection, password), database: 'master' };
+  const pool = await new sql.ConnectionPool(buildMssqlConfig(input)).connect();
+  try {
+    const colClause =
+      collation && validateIdentifier(collation, 'Collation').valid ? ` COLLATE ${collation.trim()}` : '';
+    await pool.request().batch(`CREATE DATABASE ${quoteTsqlIdentifier(check.value)}${colClause};`);
+    return `Created SQL Server database [${check.value}].`;
+  } finally {
+    await pool.close().catch(() => undefined);
+  }
+}
+
+export async function renameMssqlObject(
+  connection: ConnectionProfile,
+  password: string,
+  params: { schemaName: string; tableName: string; columnName?: string; newName: string }
+): Promise<string> {
+  const s = validateIdentifier(params.schemaName, 'Schema');
+  const t = validateIdentifier(params.tableName, 'Table');
+  const n = validateIdentifier(params.newName, 'New name');
+  if (!s.valid) throw new Error(s.error);
+  if (!t.valid) throw new Error(t.error);
+  if (!n.valid) throw new Error(n.error);
+
+  const pool = await new sql.ConnectionPool(buildMssqlConfig(profileToInput(connection, password))).connect();
+  try {
+    const req = pool.request();
+    if (params.columnName) {
+      const c = validateIdentifier(params.columnName, 'Column');
+      if (!c.valid) throw new Error(c.error);
+      req.input('objname', sql.NVarChar, `${s.value}.${t.value}.${c.value}`);
+      req.input('newname', sql.NVarChar, n.value);
+      req.input('objtype', sql.NVarChar, 'COLUMN');
+      await req.query(`EXEC sp_rename @objname = @objname, @newname = @newname, @objtype = @objtype;`);
+      return `Renamed column ${s.value}.${t.value}.${c.value} to ${n.value}.`;
+    }
+    req.input('objname', sql.NVarChar, `${s.value}.${t.value}`);
+    req.input('newname', sql.NVarChar, n.value);
+    await req.query(`EXEC sp_rename @objname = @objname, @newname = @newname;`);
+    return `Renamed table ${s.value}.${t.value} to ${s.value}.${n.value}.`;
+  } finally {
+    await pool.close().catch(() => undefined);
+  }
+}
+
+export async function getMssqlDependencies(
+  connection: ConnectionProfile,
+  password: string,
+  schemaName: string,
+  tableName: string
+): Promise<TableDependency[]> {
+  const s = validateIdentifier(schemaName, 'Schema');
+  const t = validateIdentifier(tableName, 'Table');
+  if (!s.valid) throw new Error(s.error);
+  if (!t.valid) throw new Error(t.error);
+
+  const pool = await new sql.ConnectionPool(buildMssqlConfig(profileToInput(connection, password))).connect();
+  try {
+    const req = pool.request();
+    req.input('schemaName', sql.NVarChar, s.value);
+    req.input('tableName', sql.NVarChar, t.value);
+
+    const fkRes = await req.query(`
+      SELECT
+        fk.name AS constraintName,
+        ss.name + '.' + so.name AS srcTable,
+        sc.name AS srcCol,
+        ts.name + '.' + tobj.name AS tgtTable,
+        tc.name AS tgtCol,
+        CASE WHEN ts.name = @schemaName AND tobj.name = @tableName THEN 'referencing' ELSE 'referenced' END AS dir
+      FROM sys.foreign_keys fk
+      INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
+      INNER JOIN sys.objects so ON fkc.parent_object_id = so.object_id
+      INNER JOIN sys.schemas ss ON so.schema_id = ss.schema_id
+      INNER JOIN sys.columns sc ON fkc.parent_object_id = sc.object_id AND fkc.parent_column_id = sc.column_id
+      INNER JOIN sys.objects tobj ON fkc.referenced_object_id = tobj.object_id
+      INNER JOIN sys.schemas ts ON tobj.schema_id = ts.schema_id
+      INNER JOIN sys.columns tc ON fkc.referenced_object_id = tc.object_id AND fkc.referenced_column_id = tc.column_id
+      WHERE (ss.name = @schemaName AND so.name = @tableName)
+         OR (ts.name = @schemaName AND tobj.name = @tableName)
+    `);
+
+    const viewRes = await req.query(`
+      SELECT DISTINCT
+        OBJECT_SCHEMA_NAME(d.referencing_id) + '.' + OBJECT_NAME(d.referencing_id) AS referencingObj,
+        o.type_desc AS objType
+      FROM sys.sql_expression_dependencies d
+      INNER JOIN sys.objects o ON d.referencing_id = o.object_id
+      WHERE d.referenced_id = OBJECT_ID(QUOTENAME(@schemaName) + '.' + QUOTENAME(@tableName))
+    `);
+
+    const deps: TableDependency[] = fkRes.recordset.map((r) => ({
+      direction: r.dir === 'referencing' ? 'referencing' : 'referenced',
+      objectName: r.dir === 'referencing' ? String(r.srcTable) : String(r.tgtTable),
+      objectType: 'FOREIGN_KEY',
+      constraintName: String(r.constraintName),
+      detail: `${r.srcTable}.${r.srcCol} -> ${r.tgtTable}.${r.tgtCol}`,
+    }));
+
+    for (const vr of viewRes.recordset) {
+      deps.push({
+        direction: 'view',
+        objectName: String(vr.referencingObj),
+        objectType: String(vr.objType) === 'VIEW' ? 'VIEW' : 'TABLE',
+        detail: `SQL expression dependency from ${vr.referencingObj}`,
+      });
+    }
+    return deps;
+  } finally {
+    await pool.close().catch(() => undefined);
+  }
+}
+
 export async function introspectMssql(
   connection: ConnectionProfile,
   password: string
 ): Promise<SchemaSnapshot> {
-  const pool = await new sql.ConnectionPool(
-    buildMssqlConfig({
-      host: connection.host,
-      port: connection.port,
-      database: connection.database,
-      username: connection.username,
-      password,
-      encrypt: connection.encrypt,
-      trustServerCertificate: connection.trustServerCertificate,
-    })
-  ).connect();
+  const pool = await new sql.ConnectionPool(buildMssqlConfig(profileToInput(connection, password))).connect();
 
   try {
     const tablesRes = await pool.request().query(`
@@ -476,6 +708,7 @@ export async function introspectMssql(
           tables.map((t) => ({
             f: t.fullName,
             c: t.columns.map((c) => `${c.name}:${c.sqlType}:${c.nullable}`),
+            fk: t.foreignKeys.map((fk) => `${fk.sourceColumn}->${fk.targetTable}.${fk.targetColumn}`),
           }))
         )
       )
@@ -507,20 +740,11 @@ export async function browseMssqlRows(
     sortColumn?: string;
     sortDir?: 'ASC' | 'DESC';
     search?: string;
+    filters?: RecordColumnFilter[];
     columns: string[];
   }
 ): Promise<{ rows: Record<string, unknown>[]; totalRows: number }> {
-  const pool = await new sql.ConnectionPool(
-    buildMssqlConfig({
-      host: connection.host,
-      port: connection.port,
-      database: connection.database,
-      username: connection.username,
-      password,
-      encrypt: connection.encrypt,
-      trustServerCertificate: connection.trustServerCertificate,
-    })
-  ).connect();
+  const pool = await new sql.ConnectionPool(buildMssqlConfig(profileToInput(connection, password))).connect();
 
   try {
     const tableSql = `${quoteTsqlIdentifier(params.schemaName)}.${quoteTsqlIdentifier(params.tableName)}`;
@@ -529,13 +753,32 @@ export async function browseMssqlRows(
     const offset = Math.max((params.page || 1) - 1, 0) * safeLimit;
 
     const req = pool.request();
-    let whereSql = '';
+    const whereClauses: string[] = [];
+
     if (params.search && params.search.trim() !== '') {
       req.input('searchTerm', sql.NVarChar, `%${params.search.trim()}%`);
       const likes = params.columns.map((c) => `TRY_CAST(${quoteTsqlIdentifier(c)} AS NVARCHAR(400)) LIKE @searchTerm`);
-      whereSql = `WHERE (${likes.join(' OR ')})`;
+      whereClauses.push(`(${likes.join(' OR ')})`);
     }
 
+    if (params.filters && params.filters.length > 0) {
+      params.filters.forEach((f, idx) => {
+        const colSql = quoteTsqlIdentifier(f.column);
+        const pName = `flt${idx}`;
+        if (f.operator === 'is_null') whereClauses.push(`${colSql} IS NULL`);
+        else if (f.operator === 'is_not_null') whereClauses.push(`${colSql} IS NOT NULL`);
+        else if (f.operator === 'contains') {
+          req.input(pName, sql.NVarChar, `%${f.value}%`);
+          whereClauses.push(`TRY_CAST(${colSql} AS NVARCHAR(400)) LIKE @${pName}`);
+        } else {
+          const opMap: Record<'eq' | 'neq' | 'gt' | 'lt', string> = { eq: '=', neq: '!=', gt: '>', lt: '<' };
+          req.input(pName, f.value);
+          whereClauses.push(`${colSql} ${opMap[f.operator]} @${pName}`);
+        }
+      });
+    }
+
+    const whereSql = whereClauses.length ? `WHERE ${whereClauses.join(' AND ')}` : '';
     const orderCol =
       params.sortColumn && validateIdentifier(params.sortColumn).valid
         ? quoteTsqlIdentifier(params.sortColumn)
@@ -561,21 +804,17 @@ export async function executeMssqlQuery(
   password: string,
   rawSql: string,
   params: Record<string, unknown> = {},
-  allowMutations = false
+  allowMutations = false,
+  options?: { timeoutMs?: number; maxRows?: number }
 ): Promise<QueryExecutionResult> {
   const check = validateSqlStatement(rawSql, allowMutations);
   if (!check.valid) throw new Error(check.error);
 
+  const reqTimeout = Math.min(Math.max(options?.timeoutMs ?? 15000, 1000), 60000);
+  const maxRows = Math.min(Math.max(options?.maxRows ?? 200, 1), 1000);
+
   const pool = await new sql.ConnectionPool(
-    buildMssqlConfig({
-      host: connection.host,
-      port: connection.port,
-      database: connection.database,
-      username: connection.username,
-      password,
-      encrypt: connection.encrypt,
-      trustServerCertificate: connection.trustServerCertificate,
-    })
+    buildMssqlConfig(profileToInput(connection, password), reqTimeout)
   ).connect();
 
   try {
@@ -585,7 +824,7 @@ export async function executeMssqlQuery(
     }
     const start = performance.now();
     const res = await req.query(rawSql);
-    const rows = (res.recordset ?? []).slice(0, 200);
+    const rows = (res.recordset ?? []).slice(0, maxRows);
     const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
     return {
       columns,
@@ -593,7 +832,7 @@ export async function executeMssqlQuery(
       rowCount: rows.length || res.rowsAffected.reduce((a, b) => a + b, 0),
       durationMs: Math.max(1, Math.round(performance.now() - start)),
       sqlExecuted: rawSql,
-      truncated: (res.recordset?.length ?? 0) > 200,
+      truncated: (res.recordset?.length ?? 0) > maxRows,
       statementType: check.statementType,
     };
   } finally {
@@ -613,17 +852,7 @@ export async function applyMssqlOperations(
     throw new Error(firstFail?.detail || 'Preflight validation failed.');
   }
 
-  const pool = await new sql.ConnectionPool(
-    buildMssqlConfig({
-      host: connection.host,
-      port: connection.port,
-      database: connection.database,
-      username: connection.username,
-      password,
-      encrypt: connection.encrypt,
-      trustServerCertificate: connection.trustServerCertificate,
-    })
-  ).connect();
+  const pool = await new sql.ConnectionPool(buildMssqlConfig(profileToInput(connection, password))).connect();
 
   const tx = new sql.Transaction(pool);
   try {
