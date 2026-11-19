@@ -28,40 +28,27 @@ import {
   QueryExecutionResult,
   SchemaOperation,
   SchemaSnapshot,
+  SqlServerConnectionParams,
+  SqlServerErrorCategory,
+  SqlServerHealthReport,
+  SqlServerInstanceMetadata,
+  SqlServerServerMetadata,
   TableDependency,
   TableSchema,
+  WindowsAuthDriverStatus,
 } from '../../shared/types';
 
-export interface WindowsAuthCapabilityStatus {
-  platform: NodeJS.Platform;
-  nativeSspiAvailable: boolean;
-  driverName: 'msnodesqlv8' | 'tedious-ntlm-only';
-  odbcDriverHint: string;
-  detail: string;
-}
+export type WindowsAuthCapabilityStatus = WindowsAuthDriverStatus;
+export type SqlServerHealthStatus = SqlServerHealthReport;
 
-export interface SqlServerHealthStatus {
-  healthy: boolean;
-  engineVersion: string;
-  latencyMs: number;
-  serverName?: string;
-  databaseName?: string;
-  capabilities: ConnectionCapabilities;
-  accessibleDatabases: string[];
-  errorCategory?:
-    | 'host_not_found'
-    | 'service_unavailable'
-    | 'network_unreachable'
-    | 'authentication_failed'
-    | 'insufficient_permissions'
-    | 'tls_certificate_failed'
-    | 'connection_timeout'
-    | 'named_instance_resolution_failed'
-    | 'driver_missing'
-    | 'unknown';
-  detail: string;
-  checkedAt: string;
-}
+export type {
+  SqlServerConnectionParams,
+  SqlServerErrorCategory,
+  SqlServerHealthReport,
+  SqlServerInstanceMetadata,
+  SqlServerServerMetadata,
+  WindowsAuthDriverStatus,
+};
 
 const optionalRequire = createRequire(import.meta.url);
 
@@ -72,6 +59,7 @@ export function inspectWindowsIntegratedDriverSupport(): WindowsAuthCapabilitySt
       nativeSspiAvailable: false,
       driverName: 'tedious-ntlm-only',
       odbcDriverHint: 'Microsoft ODBC Driver 18 for SQL Server (Windows only)',
+      requiresExplicitCredentials: true,
       detail:
         'Passwordless Windows Integrated Security (SSPI/Kerberos) requires Windows x64 with msnodesqlv8 and Microsoft ODBC Driver 17/18 for SQL Server. Remote NTLM requires domain, username, and password.',
     };
@@ -84,6 +72,7 @@ export function inspectWindowsIntegratedDriverSupport(): WindowsAuthCapabilitySt
       nativeSspiAvailable: true,
       driverName: 'msnodesqlv8',
       odbcDriverHint: 'ODBC Driver 18 for SQL Server',
+      requiresExplicitCredentials: false,
       detail:
         'Native Windows SSPI driver (msnodesqlv8) detected. Passwordless Windows Integrated Security is available when Microsoft ODBC Driver 17/18 is installed.',
     };
@@ -93,6 +82,7 @@ export function inspectWindowsIntegratedDriverSupport(): WindowsAuthCapabilitySt
       nativeSspiAvailable: false,
       driverName: 'tedious-ntlm-only',
       odbcDriverHint: 'Microsoft ODBC Driver 18 for SQL Server + msnodesqlv8',
+      requiresExplicitCredentials: true,
       detail:
         'Native SSPI addon (msnodesqlv8) is not compiled in this bundle. Enter Domain, Username, and Password for Windows NTLM authentication, or use SQL Server Authentication.',
     };
@@ -295,7 +285,141 @@ function profileToTestInput(connection: ConnectionProfile, secret: string): Conn
   };
 }
 
-export class SqlServerAdapter implements DatabaseAdapter {
+export interface SqlServerAdapter extends DatabaseAdapter {
+  readonly kind: 'sql_server_direct';
+  testConnection(input: ConnectionTestInput): Promise<ConnectionDiagnosticResult>;
+  listDatabases(connection: ConnectionProfile, secret: string): Promise<DatabaseInfo[]>;
+  getSchema(connection: ConnectionProfile, secret: string): Promise<SchemaSnapshot>;
+  executeQuery(
+    connection: ConnectionProfile,
+    secret: string,
+    rawSql: string,
+    params?: Record<string, unknown> | unknown[],
+    allowMutations?: boolean,
+    options?: { timeoutMs?: number; maxRows?: number }
+  ): Promise<QueryExecutionResult>;
+  checkHealth(connection: ConnectionProfile, secret: string): Promise<SqlServerHealthStatus>;
+  discoverLocalInstances(): Promise<LocalDiscoveryResponse>;
+  getWindowsAuthSupport(): WindowsAuthCapabilityStatus;
+  closeAllPools(): Promise<void>;
+}
+
+/**
+ * Abstract base class for Microsoft SQL Server adapters (direct TDS/mssql,
+ * native Windows ODBC/SSPI, or Windows Connector Agent transport).
+ * Completely separate from the optional SQLite learning sandbox (`SandboxAdapter`).
+ */
+export abstract class BaseSqlServerAdapter implements DatabaseAdapter {
+  abstract readonly kind: 'sql_server_direct' | 'sql_server_agent';
+
+  abstract testConnection(input: ConnectionTestInput): Promise<ConnectionDiagnosticResult>;
+  abstract listDatabases(connection: ConnectionProfile, secret: string): Promise<DatabaseInfo[]>;
+  abstract getSchema(connection: ConnectionProfile, secret: string): Promise<SchemaSnapshot>;
+  abstract executeQuery(
+    connection: ConnectionProfile,
+    secret: string,
+    rawSql: string,
+    params?: Record<string, unknown> | unknown[],
+    allowMutations?: boolean,
+    options?: { timeoutMs?: number; maxRows?: number }
+  ): Promise<QueryExecutionResult>;
+
+  diagnose(input: ConnectionTestInput): Promise<ConnectionDiagnosticResult> {
+    return this.testConnection(input);
+  }
+
+  introspect(connection: ConnectionProfile, secret: string): Promise<SchemaSnapshot> {
+    return this.getSchema(connection, secret);
+  }
+
+  getWindowsAuthSupport(): WindowsAuthCapabilityStatus {
+    return inspectWindowsIntegratedDriverSupport();
+  }
+
+  discoverLocalInstances(): Promise<LocalDiscoveryResponse> {
+    return discoverLocalWindowsSqlInstances();
+  }
+
+  abstract getDatabaseProperties(
+    connection: ConnectionProfile,
+    secret: string,
+    dbName: string
+  ): Promise<DatabaseInfo>;
+  abstract createDatabase(
+    connection: ConnectionProfile,
+    secret: string,
+    dbName: string,
+    collation?: string
+  ): Promise<string>;
+  abstract renameObject(
+    connection: ConnectionProfile,
+    secret: string,
+    params: { schemaName: string; tableName: string; columnName?: string; newName: string }
+  ): Promise<string>;
+  abstract getDependencies(
+    connection: ConnectionProfile,
+    secret: string,
+    schemaName: string,
+    tableName: string
+  ): Promise<TableDependency[]>;
+  abstract browseRows(
+    connection: ConnectionProfile,
+    secret: string,
+    params: BrowseRowsInput
+  ): Promise<{ rows: Record<string, unknown>[]; totalRows: number }>;
+  abstract insertRow(
+    connection: ConnectionProfile,
+    secret: string,
+    schemaName: string,
+    tableName: string,
+    values: Record<string, unknown>
+  ): Promise<void>;
+  abstract updateRowWithConcurrency(
+    connection: ConnectionProfile,
+    secret: string,
+    params: {
+      schemaName: string;
+      tableName: string;
+      pkValues: Record<string, unknown>;
+      updates: Record<string, unknown>;
+      originalValues: Record<string, unknown>;
+    }
+  ): Promise<{ updatedCount: number }>;
+  abstract deleteRowsByPk(
+    connection: ConnectionProfile,
+    secret: string,
+    schemaName: string,
+    tableName: string,
+    pkColumn: string,
+    pkValues: Array<string | number>
+  ): Promise<{ deletedCount: number }>;
+  abstract bulkUpdateRows(
+    connection: ConnectionProfile,
+    secret: string,
+    params: {
+      schemaName: string;
+      tableName: string;
+      pkColumn: string;
+      pkValues: Array<string | number>;
+      column: string;
+      value: unknown;
+    }
+  ): Promise<{ updatedCount: number }>;
+  abstract applyOperations(
+    connection: ConnectionProfile,
+    secret: string,
+    operations: SchemaOperation[],
+    snapshot: SchemaSnapshot
+  ): Promise<string>;
+  abstract checkHealth(connection: ConnectionProfile, secret: string): Promise<SqlServerHealthStatus>;
+  abstract closeAllPools(): Promise<void>;
+}
+
+/**
+ * Dedicated Microsoft SQL Server adapter (T-SQL via mssql/tedious).
+ * Completely separate from the optional SQLite learning sandbox (`SandboxAdapter`).
+ */
+export class SqlServerAdapter extends BaseSqlServerAdapter implements SqlServerAdapter {
   readonly kind = 'sql_server_direct' as const;
   private activePools = new Set<sql.ConnectionPool>();
 
@@ -377,6 +501,10 @@ export class SqlServerAdapter implements DatabaseAdapter {
       detail: classified.message,
       checkedAt: new Date().toISOString(),
     };
+  }
+
+  async testConnection(input: ConnectionTestInput): Promise<ConnectionDiagnosticResult> {
+    return this.diagnose(input);
   }
 
   async diagnose(input: ConnectionTestInput): Promise<ConnectionDiagnosticResult> {
@@ -673,6 +801,10 @@ export class SqlServerAdapter implements DatabaseAdapter {
     } finally {
       await this.closePool(pool);
     }
+  }
+
+  async getSchema(connection: ConnectionProfile, secret: string): Promise<SchemaSnapshot> {
+    return this.introspectSchema(connection, secret);
   }
 
   async introspect(connection: ConnectionProfile, secret: string): Promise<SchemaSnapshot> {
@@ -1154,8 +1286,8 @@ export class SqlServerAdapter implements DatabaseAdapter {
     connection: ConnectionProfile,
     secret: string,
     rawSql: string,
-    params: Record<string, unknown> | unknown[],
-    allowMutations: boolean,
+    params: Record<string, unknown> | unknown[] = {},
+    allowMutations = false,
     options?: { timeoutMs?: number; maxRows?: number }
   ): Promise<QueryExecutionResult> {
     const namedParams = Array.isArray(params) ? {} : params;

@@ -7,6 +7,7 @@ import {
   RecordColumnFilter,
   SchemaOperation,
   SchemaSnapshot,
+  SqlServerWindowsAuthOptions,
   TableDependency,
 } from '../../shared/types';
 
@@ -19,6 +20,7 @@ export interface ConnectionTestInput {
   username: string;
   password: string;
   domain?: string | null;
+  windowsAuth?: SqlServerWindowsAuthOptions;
   encrypt: boolean;
   trustServerCertificate: boolean;
   timeoutMs?: number;

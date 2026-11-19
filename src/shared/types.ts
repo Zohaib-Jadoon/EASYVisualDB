@@ -148,6 +148,98 @@ export interface ConnectionDiagnosticStep {
   durationMs: number;
 }
 
+export type SqlServerAuthMethod = Exclude<AuthMethod, 'sandbox_local'>;
+
+export type WindowsAuthTransportMode = 'ntlm_credentials' | 'sspi_placeholder';
+
+export interface SqlServerWindowsAuthOptions {
+  mode: WindowsAuthTransportMode;
+  domain?: string | null;
+  workstation?: string | null;
+  /**
+   * Placeholder flag for future native Windows SSPI (`msnodesqlv8` + ODBC Driver 17/18)
+   * passwordless integrated security. Never silently downgrades to SQL Auth.
+   */
+  useCurrentWindowsIdentity?: boolean;
+  odbcDriver?: string | null;
+}
+
+export interface WindowsAuthDriverStatus {
+  platform: string;
+  nativeSspiAvailable: boolean;
+  driverName: 'msnodesqlv8' | 'tedious-ntlm-only';
+  odbcDriverHint: string;
+  requiresExplicitCredentials?: boolean;
+  detail: string;
+}
+
+export type SqlServerCredentialsConfig =
+  | {
+      authMethod: 'sql_auth';
+      username: string;
+      password: string;
+    }
+  | {
+      authMethod: 'windows_integrated';
+      username: string;
+      password: string;
+      domain?: string | null;
+      windowsAuth?: SqlServerWindowsAuthOptions;
+    }
+  | {
+      authMethod: 'entra_id';
+      username: string;
+      password: string;
+      tenantId?: string;
+      clientId?: string;
+    };
+
+export interface SqlServerConnectionParams {
+  connectionName?: string;
+  method?: Exclude<ConnectionMethod, 'local_sandbox'>;
+  host: string;
+  instanceName?: string | null;
+  port: number;
+  database: string;
+  authMethod: SqlServerAuthMethod;
+  username: string;
+  password: string;
+  domain?: string | null;
+  windowsAuth?: SqlServerWindowsAuthOptions;
+  encrypt: boolean;
+  trustServerCertificate: boolean;
+  timeoutMs?: number;
+  requestTimeoutMs?: number;
+  readOnly?: boolean;
+  reconnectOnStartup?: boolean;
+  agentId?: string | null;
+}
+
+export type SqlServerErrorCategory =
+  | 'host_not_found'
+  | 'service_unavailable'
+  | 'network_unreachable'
+  | 'authentication_failed'
+  | 'insufficient_permissions'
+  | 'tls_certificate_failed'
+  | 'connection_timeout'
+  | 'named_instance_resolution_failed'
+  | 'driver_missing'
+  | 'unknown';
+
+export interface SqlServerHealthReport {
+  healthy: boolean;
+  engineVersion: string;
+  latencyMs: number;
+  serverName?: string;
+  databaseName?: string;
+  capabilities: ConnectionCapabilities;
+  accessibleDatabases: string[];
+  errorCategory?: SqlServerErrorCategory;
+  detail: string;
+  checkedAt: string;
+}
+
 export interface DiscoveredSqlInstance {
   id: string;
   serverName: string;
@@ -161,6 +253,37 @@ export interface DiscoveredSqlInstance {
   isDefaultInstance: boolean;
   isClustered?: boolean;
   source: 'windows_service' | 'windows_registry' | 'sql_browser_udp' | 'agent_probe';
+}
+
+export interface SqlServerInstanceMetadata {
+  id?: string;
+  serverName: string;
+  instanceName: string;
+  fullTarget: string;
+  port: number | null;
+  version: string;
+  edition?: string;
+  productLevel?: string;
+  collation?: string;
+  serviceName?: string;
+  serviceStatus: DiscoveredSqlInstance['serviceStatus'];
+  availability: DiscoveredSqlInstance['availability'];
+  isDefaultInstance: boolean;
+  isLocalHost?: boolean;
+  isClustered?: boolean;
+  source: DiscoveredSqlInstance['source'];
+  windowsAuthSupport?: WindowsAuthDriverStatus;
+}
+
+export interface SqlServerServerMetadata {
+  serverName: string;
+  instanceName?: string | null;
+  engineVersion: string;
+  edition?: string;
+  productLevel?: string;
+  collation?: string;
+  accessibleDatabases: string[];
+  capturedAt: string;
 }
 
 export interface LocalDiscoveryResponse {
